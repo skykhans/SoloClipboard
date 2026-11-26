@@ -1,4 +1,6 @@
 use crate::clipboard::ClipboardEntry;
+use crate::desktop::Settings;
+use serde::{de::DeserializeOwned, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -39,20 +41,43 @@ impl Storage {
     }
 
     pub fn read(path: &Path) -> io::Result<Vec<ClipboardEntry>> {
-        serde_json::from_reader(BufReader::new(File::open(path)?)).map_err(io::Error::other)
+        Self::read_json(path)
     }
 
     pub fn write(path: &Path, history: &[ClipboardEntry]) -> io::Result<()> {
+        Self::write_json(path, history)
+    }
+
+    pub fn save_history(&self, history: &[ClipboardEntry]) -> Result<(), String> {
+        Self::replace_json(&self.file_path, history)
+    }
+
+    pub fn load_settings(&self) -> io::Result<Settings> {
+        match Self::read_json(&self.file_path.with_file_name("settings.json")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Settings::default()),
+            result => result,
+        }
+    }
+
+    pub fn save_settings(&self, settings: Settings) -> Result<(), String> {
+        Self::replace_json(&self.file_path.with_file_name("settings.json"), &settings)
+    }
+
+    fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+        serde_json::from_reader(BufReader::new(File::open(path)?)).map_err(io::Error::other)
+    }
+
+    fn write_json(path: &Path, value: &(impl Serialize + ?Sized)) -> io::Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        serde_json::to_writer(&mut writer, history).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
         writer.flush()?;
         writer.get_ref().sync_all()
     }
 
-    pub fn save_history(&self, history: &[ClipboardEntry]) -> Result<(), String> {
-        let temporary_path = self.file_path.with_extension("tmp");
-        let result = Self::write(&temporary_path, history)
-            .and_then(|()| fs::rename(&temporary_path, &self.file_path));
+    fn replace_json(path: &Path, value: &(impl Serialize + ?Sized)) -> Result<(), String> {
+        let temporary_path = path.with_extension("tmp");
+        let result = Self::write_json(&temporary_path, value)
+            .and_then(|()| fs::rename(&temporary_path, path));
         if result.is_err() {
             let _ = fs::remove_file(&temporary_path);
         }

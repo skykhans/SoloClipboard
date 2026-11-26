@@ -2281,6 +2281,7 @@ dependencies = [
  "base64",
  "chrono",
  "clipboard-win",
+ "embed-resource",
  "gpui",
  "gpui_windows",
  "image",
@@ -2288,6 +2289,8 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
+ "windows-registry",
+ "windows-sys",
 ]
 
 [[package]]

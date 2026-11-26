@@ -13,6 +13,8 @@ pub struct ClipboardEntry {
     pub content: String,
     pub timestamp: chrono::DateTime<chrono::Local>,
     pub id: usize,
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ClipboardImage>,
 }
@@ -86,13 +88,14 @@ impl ClipboardMonitor {
         }
         self.history.push(ClipboardEntry {
             content,
+            timestamp: chrono::Local::now(),
+            id: self.next_id,
+            pinned: false,
             image: image.map(|image| ClipboardImage {
                 mime: image.format.mime_type().to_owned(),
                 data: STANDARD.encode(&image.bytes),
                 image: OnceCell::from(Some(Arc::new(image.clone()))),
             }),
-            timestamp: chrono::Local::now(),
-            id: self.next_id,
         });
         self.next_id += 1;
         true
