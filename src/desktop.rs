@@ -415,7 +415,21 @@ impl TrayWindow {
             tray.0.input_hooks.set(Some(
                 InputHooks::install(hwnd).map_err(|error| error.to_string())?,
             ));
-            tray.set_settings_open(false);
+            // Explorer reads the taskbar style when the window is shown.
+            let visible = IsWindowVisible(hwnd) != 0;
+            if visible {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                (style & !(WS_EX_APPWINDOW as isize)) | WS_EX_TOOLWINDOW as isize,
+            );
+            tray.set_interactive(false);
+            if visible {
+                ShowWindow(hwnd, SW_SHOWNA);
+            }
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as LPARAM);
             let large = LoadIconW(instance, ICON_RESOURCE);
             SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as LPARAM);
@@ -478,23 +492,17 @@ impl TrayWindow {
         self.0.hide();
     }
 
-    pub fn set_settings_open(&self, open: bool) {
+    pub fn set_interactive(&self, enabled: bool) {
         let hwnd = self.0.hwnd.get();
         let no_activate = WS_EX_NOACTIVATE as isize;
         unsafe {
             let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let style = if open {
+            let style = if enabled {
                 style & !no_activate
             } else {
                 style | no_activate
             };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
-            if !open && GetForegroundWindow() == hwnd {
-                let target = self.0.paste_target.get();
-                if !target.is_null() {
-                    SetForegroundWindow(target);
-                }
-            }
         }
     }
 
@@ -663,7 +671,7 @@ impl WindowState {
             }
             PostMessageW(hwnd, WM_NULL, 0, 0);
             match command as usize {
-                OPEN_MENU => self.show(HWND_TOP),
+                OPEN_MENU => self.show(HWND_TOPMOST),
                 EXIT_MENU => {
                     self.exiting.set(true);
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -722,7 +730,7 @@ unsafe extern "system" fn window_proc(
         }
         TRAY_MESSAGE => {
             match lparam as u32 {
-                WM_LBUTTONUP => state.show(HWND_TOP),
+                WM_LBUTTONUP => state.show(HWND_TOPMOST),
                 WM_RBUTTONUP => state.menu(),
                 _ => {}
             }

@@ -1,44 +1,97 @@
 use crate::desktop::window_hwnd;
 use gpui::{prelude::*, *};
+use std::borrow::Cow;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
-const LABEL: &str = "搜索剪贴板历史";
 const LINE_HEIGHT: Pixels = px(22.);
 
-pub struct SearchInput {
+pub struct TextInput {
     pub text: String,
+    label: &'static str,
+    placeholder: &'static str,
+    multiline: bool,
+    clear_button: bool,
     focus: FocusHandle,
     anchor: usize,
     cursor: usize,
     selecting: bool,
     marked: Option<Range<usize>>,
-    layout: Option<(Bounds<Pixels>, ShapedLine)>,
+    layout: Option<InputLayout>,
+    scroll: Point<Pixels>,
+    reveal_cursor: bool,
 }
 
-impl SearchInput {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+struct InputLayout {
+    origin: Point<Pixels>,
+    lines: Vec<(usize, ShapedLine)>,
+}
+
+impl InputLayout {
+    fn row(&self, index: usize) -> usize {
+        self.lines.partition_point(|(start, _)| *start <= index) - 1
+    }
+
+    fn index_at(&self, row: usize, x: Pixels) -> usize {
+        let (start, line) = &self.lines[row];
+        start + line.closest_index_for_x(x - self.origin.x)
+    }
+
+    fn position(&self, row: usize, index: usize) -> Point<Pixels> {
+        let (start, line) = &self.lines[row];
+        self.origin
+            + point(
+                line.x_for_index((index - start).min(line.len)),
+                LINE_HEIGHT * row,
+            )
+    }
+}
+
+impl TextInput {
+    pub fn search(cx: &mut Context<Self>) -> Self {
+        let mut input = Self::new("搜索剪贴板历史", "搜索剪贴板历史", String::new(), false, cx);
+        input.clear_button = true;
+        input
+    }
+
+    pub fn new(
+        label: &'static str,
+        placeholder: &'static str,
+        text: String,
+        multiline: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
-            text: String::new(),
+            text,
+            label,
+            placeholder,
+            multiline,
+            clear_button: false,
             focus: cx.focus_handle(),
             anchor: 0,
             cursor: 0,
             selecting: false,
             marked: None,
             layout: None,
+            scroll: point(px(0.), px(0.)),
+            reveal_cursor: true,
         }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus.focus(window, cx);
     }
 
     fn selection(&self) -> Range<usize> {
         self.anchor.min(self.cursor)..self.anchor.max(self.cursor)
     }
 
-    fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        self.layout.as_ref().map(|(bounds, line)| {
-            line.closest_index_for_x(x - bounds.left())
-                .min(self.text.len())
-        })
+    fn index_for_point(&self, position: Point<Pixels>) -> Option<usize> {
+        let layout = self.layout.as_ref()?;
+        let row =
+            (((position.y - layout.origin.y) / LINE_HEIGHT) as usize).min(layout.lines.len() - 1);
+        Some(layout.index_at(row, position.x).min(self.text.len()))
     }
 
     fn utf16_offset(&self, byte: usize) -> usize {
@@ -71,6 +124,7 @@ impl SearchInput {
         cx: &mut Context<Self>,
     ) {
         self.cursor = cursor;
+        self.reveal_cursor = true;
         if !extend {
             self.anchor = cursor;
         }
@@ -112,11 +166,36 @@ impl SearchInput {
                     }
                 }
             }
-            (false, "left" | "right" | "home" | "end") => {
+            (true, "home" | "end") if self.multiline => {
+                let cursor = if key.key == "home" {
+                    0
+                } else {
+                    self.text.len()
+                };
+                self.move_cursor(cursor, key.modifiers.shift, window, cx);
+            }
+            (false, "enter") if self.multiline => {
+                self.replace_text_in_range(None, "\n", window, cx);
+            }
+            (false, "left" | "right" | "home" | "end" | "up" | "down") => {
                 let extend = key.modifiers.shift;
                 let cursor = match key.key.as_str() {
-                    "home" => 0,
-                    "end" => self.text.len(),
+                    "home" | "end" | "up" | "down" => {
+                        let Some(layout) = &self.layout else { return };
+                        let row = layout.row(self.cursor);
+                        let (start, line) = &layout.lines[row];
+                        match key.key.as_str() {
+                            "home" => *start,
+                            "end" => start + line.len,
+                            "up" if row > 0 => {
+                                layout.index_at(row - 1, layout.position(row, self.cursor).x)
+                            }
+                            "down" if row + 1 < layout.lines.len() => {
+                                layout.index_at(row + 1, layout.position(row, self.cursor).x)
+                            }
+                            _ => return,
+                        }
+                    }
                     "left" if !extend && !selection.is_empty() => selection.start,
                     "right" if !extend && !selection.is_empty() => selection.end,
                     "left" => previous,
@@ -141,7 +220,7 @@ impl SearchInput {
     }
 }
 
-impl EntityInputHandler for SearchInput {
+impl EntityInputHandler for TextInput {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -189,6 +268,7 @@ impl EntityInputHandler for SearchInput {
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.marked = None;
+        self.reveal_cursor = true;
         window.notify_text_input_changed(&self.focus);
         cx.notify();
     }
@@ -201,7 +281,11 @@ impl EntityInputHandler for SearchInput {
         cx: &mut Context<Self>,
     ) {
         let range = self.edit_range(range);
-        let text = text.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+        let text = if self.multiline {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(text.replace("\r\n", " ").replace(['\r', '\n', '\t'], " "))
+        };
         self.cursor = range.start + text.len();
         self.anchor = self.cursor;
         self.text.replace_range(range, &text);
@@ -217,6 +301,7 @@ impl EntityInputHandler for SearchInput {
         cx: &mut Context<Self>,
     ) {
         let range = self.edit_range(range);
+        self.reveal_cursor = true;
         let start = range.start;
         let end = start + text.len();
         self.text.replace_range(range, text);
@@ -241,12 +326,14 @@ impl EntityInputHandler for SearchInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let (bounds, line) = self.layout.as_ref()?;
-        let left = bounds.left() + line.x_for_index(self.byte_offset(range.start));
-        let right = bounds.left() + line.x_for_index(self.byte_offset(range.end));
+        let layout = self.layout.as_ref()?;
+        let start = self.byte_offset(range.start);
+        let row = layout.row(start);
+        let left = layout.position(row, start);
+        let right = layout.position(row, self.byte_offset(range.end));
         Some(Bounds::from_corners(
-            point(left, bounds.top()),
-            point(right, bounds.bottom()),
+            point(left.x.min(right.x), left.y),
+            point(left.x.max(right.x), left.y + LINE_HEIGHT),
         ))
     }
 
@@ -256,17 +343,17 @@ impl EntityInputHandler for SearchInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.utf16_offset(self.index_for_x(point.x)?))
+        Some(self.utf16_offset(self.index_for_point(point)?))
     }
 }
 
-impl Render for SearchInput {
+impl Render for TextInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let input = cx.entity();
         div()
-            .id("search")
+            .id(self.label)
             .role(Role::TextInput)
-            .aria_label(LABEL)
+            .aria_label(self.label)
             .aria_value(self.text.clone())
             .track_focus(&self.focus)
             .tab_index(0)
@@ -284,7 +371,19 @@ impl Render for SearchInput {
             .gap_2()
             .px_3()
             .py_2()
+            .when(self.multiline, |input| input.flex_1().min_h_0())
             .on_key_down(cx.listener(Self::key_down))
+            .when(self.multiline, |input| {
+                input.on_scroll(cx.listener(|input, event: &ScrollEvent, _, cx| {
+                    let mut delta = event.delta.pixel_delta(LINE_HEIGHT);
+                    if event.modifiers.shift {
+                        delta = point(delta.x + delta.y, px(0.));
+                    }
+                    input.scroll -= delta;
+                    input.reveal_cursor = false;
+                    cx.notify();
+                }))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|input, event: &MouseDownEvent, window, cx| {
@@ -295,7 +394,7 @@ impl Render for SearchInput {
                     input.focus.focus(window, cx);
                     input.selecting = true;
                     let cursor = input
-                        .index_for_x(event.position.x)
+                        .index_for_point(event.position)
                         .unwrap_or(input.text.len());
                     input.move_cursor(cursor, event.modifiers.shift, window, cx);
                 }),
@@ -307,9 +406,13 @@ impl Render for SearchInput {
                 )
                 .min_w_0()
                 .flex_1()
-                .h(LINE_HEIGHT),
+                .when_else(
+                    self.multiline,
+                    |canvas| canvas.h_full(),
+                    |canvas| canvas.h(LINE_HEIGHT),
+                ),
             )
-            .when(!self.text.is_empty(), |input| {
+            .when(self.clear_button && !self.text.is_empty(), |input| {
                 input.child(
                     div()
                         .id("clear-search")
@@ -334,7 +437,7 @@ impl Render for SearchInput {
     }
 }
 
-impl SearchInput {
+impl TextInput {
     fn paint_text(
         entity: &Entity<Self>,
         bounds: Bounds<Pixels>,
@@ -344,85 +447,140 @@ impl SearchInput {
         let input = entity.read(cx);
         let style = window.text_style();
         let empty = input.text.is_empty();
-        let text: SharedString = if empty {
-            LABEL.into()
+        let display = if empty {
+            input.placeholder
         } else {
-            input.text.clone().into()
+            &input.text
         };
-        let mut run = TextRun {
-            len: text.len(),
-            font: style.font(),
-            color: if empty {
-                rgb(0xa2aaba).into()
-            } else {
-                style.color
-            },
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let mut start = 0;
+        let lines = display
+            .match_indices(['\r', '\n'])
+            .filter(|(end, separator)| {
+                *separator != "\r" || display.as_bytes().get(end + 1) != Some(&b'\n')
+            })
+            .chain(std::iter::once((display.len(), "")))
+            .map(|(end, separator)| {
+                let offset = start;
+                start = end + separator.len();
+                let text = display[offset..end]
+                    .strip_suffix('\r')
+                    .unwrap_or(&display[offset..end]);
+                let mut run = style.to_run(text.len());
+                if empty {
+                    run.color = rgb(0xa2aaba).into();
+                }
+                let mut runs = Vec::new();
+                if let Some(marked) = &input.marked {
+                    let from = marked.start.saturating_sub(offset).min(text.len());
+                    let to = marked.end.saturating_sub(offset).min(text.len());
+                    if from < to {
+                        runs.push(TextRun {
+                            len: from,
+                            ..run.clone()
+                        });
+                        runs.push(TextRun {
+                            len: to - from,
+                            underline: Some(UnderlineStyle {
+                                color: Some(run.color),
+                                thickness: px(1.),
+                                wavy: false,
+                            }),
+                            ..run.clone()
+                        });
+                        run.len -= to;
+                    }
+                }
+                runs.push(run);
+                runs.retain(|run| run.len > 0);
+                let line = window.text_system().shape_line(
+                    text.replace('\t', " ").into(),
+                    style.font_size.to_pixels(window.rem_size()),
+                    &runs,
+                    None,
+                );
+                (offset, line)
+            })
+            .collect();
+        let mut layout = InputLayout {
+            origin: bounds.origin,
+            lines,
         };
-        let mut runs = Vec::new();
-        if let Some(marked) = &input.marked {
-            runs.push(TextRun {
-                len: marked.start,
-                ..run.clone()
-            });
-            runs.push(TextRun {
-                len: marked.len(),
-                underline: Some(UnderlineStyle {
-                    color: Some(run.color),
-                    thickness: px(1.),
-                    wavy: false,
-                }),
-                ..run.clone()
-            });
-            run.len -= marked.end;
-        }
-        runs.push(run);
-        runs.retain(|run| run.len > 0);
-        let line = window.text_system().shape_line(
-            text,
-            style.font_size.to_pixels(window.rem_size()),
-            &runs,
-            None,
-        );
         let focus = input.focus.clone();
         let focused = focus.is_focused(window);
         let selection = input.selection();
-        let cursor = line.x_for_index(input.cursor);
-        let mut line_bounds = bounds;
-        if !empty {
-            line_bounds.origin.x -= (cursor + px(2.) - bounds.size.width).max(px(0.));
+        let row = layout.row(input.cursor);
+        let cursor = layout.position(row, input.cursor) - bounds.origin;
+        let mut scroll = input.scroll;
+        if input.reveal_cursor {
+            scroll.x = scroll
+                .x
+                .min(cursor.x)
+                .max(cursor.x + px(2.) - bounds.size.width);
+            scroll.y = scroll
+                .y
+                .min(cursor.y)
+                .max(cursor.y + LINE_HEIGHT - bounds.size.height);
         }
+        let width = layout
+            .lines
+            .iter()
+            .map(|(_, line)| line.width)
+            .max()
+            .unwrap();
+        scroll.x = if empty {
+            px(0.)
+        } else {
+            scroll
+                .x
+                .clamp(px(0.), (width + px(2.) - bounds.size.width).max(px(0.)))
+        };
+        scroll.y = scroll.y.clamp(
+            px(0.),
+            (LINE_HEIGHT * layout.lines.len() - bounds.size.height).max(px(0.)),
+        );
+        layout.origin = bounds.origin - scroll;
         window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
-        let height = window.line_height();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            if focused && !selection.is_empty() {
-                let start = line.x_for_index(selection.start);
-                let end = line.x_for_index(selection.end);
-                let position = point(line_bounds.left() + start.min(end), bounds.top());
-                window.paint_quad(fill(
-                    Bounds::new(position, size((end - start).abs(), height)),
-                    rgb(0x325b96),
-                ));
+            for (row, (start, line)) in layout.lines.iter().enumerate() {
+                let origin = layout.position(row, *start);
+                if origin.y + LINE_HEIGHT <= bounds.top() {
+                    continue;
+                }
+                if origin.y >= bounds.bottom() {
+                    break;
+                }
+                let end = *start + line.len;
+                if focused
+                    && !selection.is_empty()
+                    && selection.end > *start
+                    && selection.start <= end
+                {
+                    let left = layout.position(row, selection.start.max(*start)).x;
+                    let right = layout.position(row, selection.end.min(end)).x
+                        + if selection.end > end { px(4.) } else { px(0.) };
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(left.min(right), origin.y),
+                            size((right - left).abs(), LINE_HEIGHT),
+                        ),
+                        rgb(0x325b96),
+                    ));
+                }
+                let _ = line.paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx);
             }
-            let _ = line.paint(
-                line_bounds.origin,
-                height,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
             if focused && selection.is_empty() {
-                let position = point(line_bounds.left() + cursor, bounds.top() + px(2.));
+                let position = layout.origin + cursor + point(px(0.), px(2.));
                 window.paint_quad(fill(
-                    Bounds::new(position, size(px(1.), height - px(4.))),
+                    Bounds::new(position, size(px(1.), LINE_HEIGHT - px(4.))),
                     rgb(0xcce0ff),
                 ));
             }
         });
-        entity.update(cx, |input, _| input.layout = Some((line_bounds, line)));
+        entity.update(cx, |input, _| {
+            input.layout = Some(layout);
+            input.scroll = scroll;
+            input.reveal_cursor = false;
+        });
 
         let drag_selection =
             window.listener_for(entity, |input, event: &MouseMoveEvent, window, cx| {
@@ -430,7 +588,7 @@ impl SearchInput {
                     return;
                 }
                 if let Some(cursor) = input
-                    .index_for_x(event.position.x)
+                    .index_for_point(event.position)
                     .filter(|&cursor| cursor != input.cursor)
                 {
                     input.move_cursor(cursor, true, window, cx);

@@ -37,11 +37,7 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: false,
-                        traffic_light_position: None,
-                    }),
+                    titlebar: None,
                     window_min_size: Some(size(px(400.0), px(300.0))),
                     kind: WindowKind::Normal,
                     show: !startup,

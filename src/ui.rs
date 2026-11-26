@@ -1,8 +1,8 @@
 use crate::clipboard::{ClipboardEntry, ClipboardMonitor};
 use crate::desktop::{self, Settings, Shortcut, TrayWindow};
-use crate::search::SearchInput;
+use crate::search::TextInput;
 use crate::storage::Storage;
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, Months, NaiveDate};
 use gpui::{prelude::*, *};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
@@ -11,6 +11,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    LoadCursorW, PostMessageW, SetCursor, HCURSOR, IDC_HAND, WM_CLOSE,
+};
+
+const BUTTON_COLORS: (u32, u32) = (0x30343e, 0x404655);
+const PRIMARY_BUTTON_COLORS: (u32, u32) = (0x31527d, 0x3c6498);
 
 fn search_highlights(text: &str, query: &str) -> Vec<(Range<usize>, HighlightStyle)> {
     if query.is_empty() {
@@ -147,18 +153,14 @@ impl Render for ConfirmationPrompt {
                     })
                     .child(div().mt_2().flex().justify_end().gap_2().children(
                         self.buttons.iter().enumerate().map(|(index, button)| {
-                            ClipboardView::button(button.label().clone())
+                            let colors = if self.warning && matches!(button, PromptButton::Ok(_)) {
+                                (0x713c42, 0x8b494e)
+                            } else {
+                                BUTTON_COLORS
+                            };
+                            ClipboardView::button_with_colors(button.label().clone(), colors)
                                 .tab_index(index as isize)
-                                .focus(|style| style.bg(rgb(0x404655)))
-                                .when(
-                                    self.warning && matches!(button, PromptButton::Ok(_)),
-                                    |button| {
-                                        button
-                                            .bg(rgb(0x713c42))
-                                            .hover(|style| style.bg(rgb(0x8b494e)))
-                                            .focus(|style| style.bg(rgb(0x8b494e)))
-                                    },
-                                )
+                                .focus(move |style| style.bg(rgb(colors.1)))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.emit(PromptResponse(index));
                                 }))
@@ -168,14 +170,21 @@ impl Render for ConfirmationPrompt {
     }
 }
 
+enum HistoryPanel {
+    Edit { id: usize, input: Entity<TextInput> },
+    DeleteDate(NaiveDate),
+}
+
 pub struct ClipboardView {
     monitor: ClipboardMonitor,
     storage: Option<Storage>,
-    search: Entity<SearchInput>,
+    search: Entity<TextInput>,
     history_scroll: ScrollHandle,
     date_menu: Option<Bounds<Pixels>>,
-    scrollbar_drag: Rc<Cell<Option<Pixels>>>,
+    scrollbar_drag: Rc<Cell<Option<(Pixels, HCURSOR)>>>,
     selection: Option<HashSet<usize>>,
+    history_panel: Option<HistoryPanel>,
+    panel_error: Option<&'static str>,
     status: Option<(String, bool)>,
     status_timeout: Option<Task<()>>,
     tray: Option<TrayWindow>,
@@ -217,7 +226,7 @@ impl ClipboardView {
                 }
             }
         });
-        let search = cx.new(SearchInput::new);
+        let search = cx.new(TextInput::search);
         let search_subscription = cx.observe(&search, |view, _, cx| {
             view.date_menu = None;
             cx.notify();
@@ -227,7 +236,9 @@ impl ClipboardView {
                 && event.keystroke.modifiers == Modifiers::default()
                 && !window.has_active_prompt()
             {
-                if view.date_menu.take().is_some() {
+                if view.history_panel.is_some() {
+                    view.close_history_panel(window, cx);
+                } else if view.date_menu.take().is_some() {
                     cx.notify();
                 } else if let Some(tray) = &view.tray {
                     tray.hide();
@@ -262,6 +273,8 @@ impl ClipboardView {
             date_menu: None,
             scrollbar_drag: Rc::default(),
             selection: None,
+            history_panel: None,
+            panel_error: None,
             status,
             status_timeout: None,
             tray,
@@ -273,6 +286,14 @@ impl ClipboardView {
             _search_subscription: search_subscription,
             _escape_subscription: escape_subscription,
         }
+    }
+
+    fn stop_scrollbar_drag(drag: &Cell<Option<(Pixels, HCURSOR)>>) -> bool {
+        let Some((_, cursor)) = drag.take() else {
+            return false;
+        };
+        unsafe { SetCursor(cursor) };
+        true
     }
 
     fn history_scrollbar(&self) -> impl IntoElement {
@@ -289,7 +310,7 @@ impl ClipboardView {
             },
             move |bounds, hitbox, window, _| {
                 let Some(hitbox) = hitbox else {
-                    drag.set(None);
+                    Self::stop_scrollbar_drag(&drag);
                     return;
                 };
                 let max_offset = scroll.max_offset().y;
@@ -312,7 +333,6 @@ impl ClipboardView {
                 };
                 window.paint_quad(fill(track, rgb(0x30343e)).corner_radii(px(3.)));
                 window.paint_quad(fill(thumb, rgb(0x89919f)).corner_radii(px(3.)));
-
                 window.on_mouse_event({
                     let drag = drag.clone();
                     let scroll = scroll.clone();
@@ -320,7 +340,7 @@ impl ClipboardView {
                         if !phase.capture() || event.button != MouseButton::Left {
                             return;
                         }
-                        drag.set(None);
+                        Self::stop_scrollbar_drag(&drag);
                         if !hitbox.is_hovered(window) {
                             return;
                         }
@@ -336,7 +356,9 @@ impl ClipboardView {
                             scroll.set_offset(offset);
                             window.refresh();
                         } else {
-                            drag.set(Some(y - thumb.top()));
+                            let cursor =
+                                unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND)) };
+                            drag.set(Some((y - thumb.top(), cursor)));
                         }
                         cx.stop_propagation();
                     }
@@ -348,10 +370,10 @@ impl ClipboardView {
                             return;
                         }
                         if event.pressed_button != Some(MouseButton::Left) {
-                            drag.set(None);
+                            Self::stop_scrollbar_drag(&drag);
                             return;
                         }
-                        let Some(grab_offset) = drag.get().filter(|_| travel > px(0.)) else {
+                        let Some((grab_offset, _)) = drag.get().filter(|_| travel > px(0.)) else {
                             return;
                         };
                         let position = event.position.y - track.top() - grab_offset;
@@ -363,7 +385,9 @@ impl ClipboardView {
                     }
                 });
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-                    if phase.capture() && event.button == MouseButton::Left && drag.take().is_some()
+                    if phase.capture()
+                        && event.button == MouseButton::Left
+                        && Self::stop_scrollbar_drag(&drag)
                     {
                         cx.stop_propagation();
                     }
@@ -514,6 +538,262 @@ impl ClipboardView {
         }
     }
 
+    fn open_history_panel(
+        &mut self,
+        panel: HistoryPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_panel = Some(panel);
+        self.date_menu = None;
+        if let Some(tray) = &self.tray {
+            tray.set_interactive(true);
+        }
+        window.activate_window();
+        cx.notify();
+    }
+
+    fn close_history_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_panel = None;
+        self.panel_error = None;
+        window.blur(cx);
+        if let Some(tray) = &self.tray {
+            tray.set_interactive(false);
+        }
+        cx.notify();
+    }
+
+    fn edit_entry(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.monitor.history.iter().find(|entry| entry.id == id) {
+            let text = entry.content.clone();
+            let input = cx.new(|cx| TextInput::new("剪贴板文本", "", text, true, cx));
+            self.open_history_panel(
+                HistoryPanel::Edit {
+                    id,
+                    input: input.clone(),
+                },
+                window,
+                cx,
+            );
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(HistoryPanel::Edit { id, input }) = &self.history_panel else {
+            return;
+        };
+        let text = &input.read(cx).text;
+        if text.is_empty() {
+            self.panel_error = Some("请输入文本。");
+            cx.notify();
+            return;
+        }
+        if let Some(entry) = self
+            .monitor
+            .history
+            .iter_mut()
+            .find(|entry| entry.id == *id)
+        {
+            if entry.content != *text {
+                entry.content.clone_from(text);
+                self.save_history_change(cx);
+            }
+        }
+        self.close_history_panel(window, cx);
+    }
+
+    fn open_delete_date(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let date = self
+            .monitor
+            .history
+            .iter()
+            .map(|entry| entry.timestamp.date_naive())
+            .max()
+            .unwrap_or_else(|| Local::now().date_naive());
+        self.open_history_panel(
+            HistoryPanel::DeleteDate(date.with_day(1).unwrap()),
+            window,
+            cx,
+        );
+    }
+
+    fn confirm_delete_date(
+        &mut self,
+        date: NaiveDate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection: HashSet<_> = self
+            .monitor
+            .history
+            .iter()
+            .filter(|entry| entry.timestamp.date_naive() == date)
+            .map(|entry| entry.id)
+            .collect();
+        if selection.is_empty() {
+            return;
+        }
+        let title = format!("删除 {date} 的记录？");
+        let message = format!("将删除当天的 {} 条记录，包含置顶记录。", selection.len());
+        let response = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&message),
+            &[PromptButton::cancel("取消"), PromptButton::ok("删除")],
+            cx,
+        );
+        cx.spawn_in(window, async move |view, cx| {
+            if response.await == Ok(1) {
+                let _ = view.update_in(cx, |view, window, cx| {
+                    view.monitor
+                        .history
+                        .retain(|entry| !selection.contains(&entry.id));
+                    if let Some(selected) = &mut view.selection {
+                        selected.retain(|id| !selection.contains(id));
+                    }
+                    view.save_history_change(cx);
+                    view.close_history_panel(window, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn delete_calendar(&self, month: NaiveDate, cx: &Context<Self>) -> impl IntoElement {
+        let previous = month.checked_sub_months(Months::new(1));
+        let next = month.checked_add_months(Months::new(1));
+        let dates_with_records: HashSet<_> = self
+            .monitor
+            .history
+            .iter()
+            .map(|entry| entry.timestamp.date_naive())
+            .filter(|date| date.year() == month.year() && date.month() == month.month())
+            .collect();
+        let days = month
+            .iter_days()
+            .take_while(|date| date.month() == month.month());
+        let day_height = px(20.);
+        let cell = || div().h(day_height).flex().items_center().justify_center();
+        let month_button = |label, glyph, target: Option<NaiveDate>| {
+            target.map(|target| {
+                Self::button_base(label, BUTTON_COLORS)
+                    .w(px(36.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tab_index(0)
+                    .child(glyph)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.history_panel = Some(HistoryPanel::DeleteDate(target));
+                        cx.notify();
+                    }))
+            })
+        };
+
+        div()
+            .id("delete-calendar")
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(320.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .children(month_button("上个月", "‹", previous))
+                            .child(month.format("%Y 年 %m 月").to_string())
+                            .children(month_button("下个月", "›", next)),
+                    )
+                    .child(
+                        div()
+                            .grid()
+                            .grid_cols(7)
+                            .gap_0p5()
+                            .children(
+                                ["一", "二", "三", "四", "五", "六", "日"]
+                                    .map(|day| cell().text_color(rgb(0xaab2c3)).child(day)),
+                            )
+                            .children((0..month.weekday().num_days_from_monday()).map(|_| cell()))
+                            .children(days.map(|date| {
+                                let day = date.day().to_string();
+                                if dates_with_records.contains(&date) {
+                                    Self::button_base(date.to_string(), BUTTON_COLORS)
+                                        .h(day_height)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .tab_index(0)
+                                        .child(day)
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.confirm_delete_date(date, window, cx);
+                                        }))
+                                        .into_any_element()
+                                } else {
+                                    cell()
+                                        .text_color(rgb(0x8790a2))
+                                        .child(day)
+                                        .into_any_element()
+                                }
+                            })),
+                    ),
+            )
+    }
+
+    fn history_panel(&self, panel: &HistoryPanel, cx: &Context<Self>) -> Div {
+        let (title, form, submit) = match panel {
+            HistoryPanel::Edit { input, .. } => (
+                "编辑剪贴板文本",
+                input.clone().into_any_element(),
+                Some(
+                    Self::button_with_colors("保存", PRIMARY_BUTTON_COLORS)
+                        .on_click(cx.listener(|view, _, window, cx| view.save_edit(window, cx))),
+                ),
+            ),
+            HistoryPanel::DeleteDate(month) => (
+                "选择要删除的日期",
+                self.delete_calendar(*month, cx).into_any_element(),
+                None,
+            ),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when_else(
+                matches!(panel, HistoryPanel::DeleteDate(_)),
+                |panel| panel.gap_2().p_2(),
+                |panel| panel.gap_3().p_3(),
+            )
+            .child(div().flex_shrink_0().text_base().child(title))
+            .child(form)
+            .when_some(self.panel_error, |panel, error| {
+                panel.child(div().text_color(rgb(0xffacaa)).child(error))
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Self::button("取消").on_click(cx.listener(|view, _, window, cx| {
+                            view.close_history_panel(window, cx);
+                        })),
+                    )
+                    .children(submit),
+            )
+    }
+
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.is_window_active() {
             window.activate_window();
@@ -537,7 +817,7 @@ impl ClipboardView {
         .detach();
     }
 
-    fn button_base(label: impl Into<SharedString>) -> Stateful<Div> {
+    fn button_base(label: impl Into<SharedString>, colors: (u32, u32)) -> Stateful<Div> {
         let label = label.into();
         div()
             .id(label.clone())
@@ -545,21 +825,33 @@ impl ClipboardView {
             .aria_label(label)
             .flex_shrink_0()
             .rounded_md()
-            .bg(rgb(0x30343e))
-            .hover(|style| style.bg(rgb(0x404655)))
+            .bg(rgb(colors.0))
+            .hover(move |style| style.bg(rgb(colors.1)))
             .cursor_pointer()
     }
 
     fn button(label: impl Into<SharedString>) -> Stateful<Div> {
+        Self::button_with_colors(label, BUTTON_COLORS)
+    }
+
+    fn button_with_colors(label: impl Into<SharedString>, colors: (u32, u32)) -> Stateful<Div> {
         let label = label.into();
-        Self::button_base(label.clone())
+        Self::button_base(label.clone(), colors)
             .px_3()
             .py_1p5()
             .child(label)
     }
 
     fn icon_button(label: &'static str, glyph: &'static str) -> Stateful<Div> {
-        Self::button_base(label)
+        Self::icon_button_with_colors(label, glyph, BUTTON_COLORS)
+    }
+
+    fn icon_button_with_colors(
+        label: &'static str,
+        glyph: &'static str,
+        colors: (u32, u32),
+    ) -> Stateful<Div> {
+        Self::button_base(label, colors)
             .size(px(40.))
             .flex()
             .items_center()
@@ -621,8 +913,8 @@ impl ClipboardView {
                 },
             )
             .child(
-                Self::icon_button("清空全部", "\u{e894}")
-                    .on_click(cx.listener(|view, _, window, cx| view.clear_history(window, cx))),
+                Self::icon_button("按日期删除", "\u{e787}")
+                    .on_click(cx.listener(|view, _, window, cx| view.open_delete_date(window, cx))),
             )
             .when(self.has_tray(), |toolbar| {
                 toolbar.child(Self::icon_button("设置", "\u{e713}").on_click(cx.listener(
@@ -637,7 +929,7 @@ impl ClipboardView {
                         };
                         view.settings_open = true;
                         if let Some(tray) = &view.tray {
-                            tray.set_settings_open(true);
+                            tray.set_interactive(true);
                         }
                         cx.notify();
                     },
@@ -657,11 +949,12 @@ impl ClipboardView {
     }
 
     fn setting_option(label: &'static str, selected: bool) -> Stateful<Div> {
-        Self::button(label).when(selected, |button| {
-            button
-                .bg(rgb(0x31564b))
-                .hover(|style| style.bg(rgb(0x31564b)))
-        })
+        let colors = if selected {
+            (0x31564b, 0x31564b)
+        } else {
+            BUTTON_COLORS
+        };
+        Self::button_with_colors(label, colors)
     }
 
     fn settings(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
@@ -691,7 +984,7 @@ impl ClipboardView {
                             window.blur(cx);
                             view.settings_open = false;
                             if let Some(tray) = &view.tray {
-                                tray.set_settings_open(false);
+                                tray.set_interactive(false);
                             }
                             cx.notify();
                         },
@@ -829,12 +1122,18 @@ impl ClipboardView {
                         ))
                     }),
             )
+            .child(
+                Self::settings_section("剪贴板历史").child(
+                    div().flex().child(Self::button("清空全部").on_click(
+                        cx.listener(|view, _, window, cx| view.clear_history(window, cx)),
+                    )),
+                ),
+            )
     }
 
     fn history_date(date: NaiveDate, index: usize, view: WeakEntity<Self>) -> Stateful<Div> {
         let label = date.to_string();
-        Self::button_base(label.clone())
-            .bg(rgb(0x21252d))
+        Self::button_base(label.clone(), (0x21252d, BUTTON_COLORS.1))
             .flex()
             .items_center()
             .gap_2()
@@ -1073,15 +1372,31 @@ impl ClipboardView {
                                 div()
                                     .flex()
                                     .gap_1()
+                                    .when(entry.image.is_none(), |buttons| {
+                                        buttons.child(
+                                            Self::icon_button("编辑", "\u{e70f}")
+                                                .size(px(28.))
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        view.edit_entry(id, window, cx);
+                                                    },
+                                                )),
+                                        )
+                                    })
                                     .child(
-                                        Self::icon_button(pin_label, pin_icon)
-                                            .size(px(28.))
-                                            .when(entry.pinned, |button| {
-                                                button
-                                                    .bg(rgb(0x31564b))
-                                                    .hover(|style| style.bg(rgb(0x406a5e)))
-                                            })
-                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                        Self::icon_button_with_colors(
+                                            pin_label,
+                                            pin_icon,
+                                            if entry.pinned {
+                                                (0x31564b, 0x406a5e)
+                                            } else {
+                                                BUTTON_COLORS
+                                            },
+                                        )
+                                        .size(px(28.))
+                                        .on_click(
+                                            cx.listener(move |view, _, _, cx| {
                                                 cx.stop_propagation();
                                                 if let Some(entry) = view
                                                     .monitor
@@ -1092,7 +1407,8 @@ impl ClipboardView {
                                                     entry.pinned = !entry.pinned;
                                                     view.save_history_change(cx);
                                                 }
-                                            })),
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         Self::icon_button("删除", "\u{e74d}")
@@ -1110,9 +1426,94 @@ impl ClipboardView {
     }
 }
 
+impl ClipboardView {
+    fn history(&self, cx: &Context<Self>) -> Div {
+        let query = self.search.read(cx).text.trim().to_lowercase();
+        let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for entry in self.monitor.history.iter().rev().filter(|entry| {
+            query.is_empty()
+                || entry.content.to_lowercase().contains(&query)
+                || (entry.image.is_some() && ("图片".contains(&query) || "image".contains(&query)))
+        }) {
+            groups
+                .entry(entry.timestamp.date_naive())
+                .or_default()
+                .push(entry);
+        }
+        let mut dates = Vec::with_capacity(groups.len());
+        let mut rows = Vec::new();
+        for (date, mut entries) in groups.into_iter().rev() {
+            let index = rows.len();
+            dates.push((date, index));
+            rows.push(Self::history_date(date, index, cx.weak_entity()).into_any_element());
+            entries.sort_by_key(|entry| !entry.pinned);
+            rows.extend(
+                entries
+                    .into_iter()
+                    .map(|entry| self.history_item(entry, &query, cx).into_any_element()),
+            );
+        }
+        let empty = rows.is_empty();
+        let date_menu = self
+            .date_menu
+            .map(|anchor| Self::history_date_menu(anchor, &dates, cx));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(self.toolbar(cx))
+            .child(
+                div()
+                    .relative()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("clipboard-history")
+                            .min_h_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.history_scroll)
+                            .gap_2()
+                            .px_3()
+                            .pb_3()
+                            .when(empty, |list| {
+                                list.child(
+                                    div().p_4().text_center().text_color(rgb(0xaab2c3)).child(
+                                        if query.is_empty() {
+                                            "暂无剪贴板记录"
+                                        } else {
+                                            "没有匹配的记录"
+                                        },
+                                    ),
+                                )
+                            })
+                            .children(rows),
+                    )
+                    .when(!empty, |list| {
+                        list.child(self.sticky_history_date(dates, cx))
+                    })
+                    .child(self.history_scrollbar()),
+            )
+            .children(date_menu)
+    }
+}
+
 impl Render for ClipboardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let query = self.search.read(cx).text.trim().to_lowercase();
+        let content = if let Some(panel) = &self.history_panel {
+            self.history_panel(panel, cx).into_any_element()
+        } else if self.settings_open {
+            self.settings(window, cx).into_any_element()
+        } else {
+            self.history(cx).into_any_element()
+        };
         div()
             .relative()
             .size_full()
@@ -1122,85 +1523,32 @@ impl Render for ClipboardView {
             .bg(rgb(0x1b1e25))
             .text_color(rgb(0xe8ebf2))
             .text_sm()
-            .when_else(
-                self.settings_open,
-                |view| view.child(self.settings(window, cx)),
-                |view| {
-                    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
-                    for entry in self.monitor.history.iter().rev().filter(|entry| {
-                        query.is_empty()
-                            || entry.content.to_lowercase().contains(&query)
-                            || (entry.image.is_some()
-                                && ("图片".contains(&query) || "image".contains(&query)))
-                    }) {
-                        groups
-                            .entry(entry.timestamp.date_naive())
-                            .or_default()
-                            .push(entry);
-                    }
-                    let mut dates = Vec::with_capacity(groups.len());
-                    let mut rows = Vec::new();
-                    for (date, mut entries) in groups.into_iter().rev() {
-                        let index = rows.len();
-                        dates.push((date, index));
-                        rows.push(
-                            Self::history_date(date, index, cx.weak_entity()).into_any_element(),
-                        );
-                        entries.sort_by_key(|entry| !entry.pinned);
-                        rows.extend(
-                            entries.into_iter().map(|entry| {
-                                self.history_item(entry, &query, cx).into_any_element()
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .h(px(36.))
+                    .pt(px(6.))
+                    .pr_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                    .child(
+                        Self::icon_button_with_colors("关闭窗口", "\u{e8bb}", (0x1b1e25, 0xc42b1c))
+                            .w(px(36.))
+                            .h(px(24.))
+                            .on_click(|_, window, _| {
+                                if let Ok(hwnd) = desktop::window_hwnd(window) {
+                                    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                                }
                             }),
-                        );
-                    }
-                    let empty = rows.is_empty();
-                    let date_menu = self
-                        .date_menu
-                        .map(|anchor| Self::history_date_menu(anchor, &dates, cx));
-                    view.child(self.toolbar(cx))
-                        .child(
-                            div()
-                                .relative()
-                                .min_h_0()
-                                .flex_1()
-                                .overflow_hidden()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .id("clipboard-history")
-                                        .min_h_0()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.history_scroll)
-                                        .gap_2()
-                                        .px_3()
-                                        .pb_3()
-                                        .when(empty, |list| {
-                                            list.child(
-                                                div()
-                                                    .p_4()
-                                                    .text_center()
-                                                    .text_color(rgb(0xaab2c3))
-                                                    .child(if query.is_empty() {
-                                                        "暂无剪贴板记录"
-                                                    } else {
-                                                        "没有匹配的记录"
-                                                    }),
-                                            )
-                                        })
-                                        .children(rows),
-                                )
-                                .when(!empty, |list| {
-                                    list.child(self.sticky_history_date(dates, cx))
-                                })
-                                .child(self.history_scrollbar()),
-                        )
-                        .children(date_menu)
-                },
+                    ),
             )
+            .child(content)
             .when_some(self.status.as_ref(), |view, (message, is_error)| {
                 view.child(
                     div()
