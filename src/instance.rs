@@ -94,7 +94,7 @@ unsafe extern "system" fn instance_proc(
     unsafe {
         match message {
             REOPEN_WINDOW => {
-                ShowWindow(hwnd, SW_MAXIMIZE);
+                ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
                 return 0;
             }
