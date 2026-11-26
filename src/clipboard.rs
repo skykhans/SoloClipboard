@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clipboard_win::{formats::CF_DIB, raw, Clipboard};
-use gpui::{App, ClipboardEntry as SystemEntry, ClipboardItem, Image, ImageFormat, Window};
+use gpui::{App, ClipboardEntry as SystemEntry, Image, ImageFormat, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::OnceCell;
 use std::collections::HashSet;
@@ -101,15 +101,25 @@ impl ClipboardMonitor {
         true
     }
 
-    pub fn copy_entry(&mut self, id: usize, window: &Window, cx: &App) -> Result<(), String> {
-        let Some(entry) = self.history.iter().find(|entry| entry.id == id) else {
-            return Ok(());
+    pub fn copy_entry(&mut self, id: usize, window: &Window) -> Result<(), String> {
+        let entry = self
+            .history
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or("记录已删除")?;
+        let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err("无法获取 Windows 窗口句柄".into());
         };
         if let Some(image) = &entry.image {
             let image = image.load().ok_or("图片数据无法读取")?;
-            write_image(&image, window)?;
+            write_image(&image, handle)?;
         } else {
-            cx.write_to_clipboard(ClipboardItem::new_string(entry.content.clone()));
+            let _clipboard =
+                Clipboard::new_for(handle.hwnd.get() as _).map_err(|error| error.to_string())?;
+            raw::empty().map_err(|error| error.to_string())?;
+            raw::set_string_with(&entry.content, clipboard_win::options::NoClear)
+                .map_err(|error| error.to_string())?;
         }
         self.sequence = clipboard_win::seq_num();
         Ok(())
@@ -137,11 +147,7 @@ impl ClipboardMonitor {
     }
 }
 
-fn write_image(image: &Image, window: &Window) -> Result<(), String> {
-    let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return Err("无法获取 Windows 窗口句柄".into());
-    };
+fn write_image(image: &Image, handle: raw_window_handle::Win32WindowHandle) -> Result<(), String> {
     let clipboard_format = |name| {
         raw::register_format(name)
             .map(NonZeroU32::get)

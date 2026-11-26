@@ -23,6 +23,108 @@ impl Render for ToolbarTooltip {
     }
 }
 
+pub fn render_prompt(
+    level: PromptLevel,
+    message: &str,
+    detail: Option<&str>,
+    buttons: &[PromptButton],
+    handle: PromptHandle,
+    window: &mut Window,
+    cx: &mut App,
+) -> RenderablePromptHandle {
+    let prompt = cx.new(|cx| ConfirmationPrompt {
+        focus: cx.focus_handle(),
+        title: message.into(),
+        detail: detail.map(SharedString::from),
+        buttons: buttons.to_vec(),
+        warning: matches!(level, PromptLevel::Warning | PromptLevel::Critical),
+    });
+    handle.with_view(prompt, window, cx)
+}
+
+struct ConfirmationPrompt {
+    focus: FocusHandle,
+    title: SharedString,
+    detail: Option<SharedString>,
+    buttons: Vec<PromptButton>,
+    warning: bool,
+}
+
+impl EventEmitter<PromptResponse> for ConfirmationPrompt {}
+
+impl Focusable for ConfirmationPrompt {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for ConfirmationPrompt {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cancel = self.buttons.iter().position(PromptButton::is_cancel);
+
+        div()
+            .size_full()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(black().opacity(0.55))
+            .child(
+                div()
+                    .id("confirmation")
+                    .role(Role::Dialog)
+                    .aria_label(self.title.clone())
+                    .track_focus(&self.focus)
+                    .tab_group()
+                    .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
+                        if let Some(index) = cancel.filter(|_| event.keystroke.key == "escape") {
+                            cx.emit(PromptResponse(index));
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .w(px(340.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x393e4a))
+                    .bg(rgb(0x252831))
+                    .text_color(rgb(0xe8ebf2))
+                    .text_sm()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.title.clone()),
+                    )
+                    .when_some(self.detail.clone(), |dialog, detail| {
+                        dialog.child(div().text_color(rgb(0xaab2c3)).child(detail))
+                    })
+                    .child(div().mt_2().flex().justify_end().gap_2().children(
+                        self.buttons.iter().enumerate().map(|(index, button)| {
+                            ClipboardView::button(button.label().clone())
+                                .tab_index(index as isize)
+                                .focus(|style| style.bg(rgb(0x404655)))
+                                .when(
+                                    self.warning && matches!(button, PromptButton::Ok(_)),
+                                    |button| {
+                                        button
+                                            .bg(rgb(0x713c42))
+                                            .hover(|style| style.bg(rgb(0x8b494e)))
+                                            .focus(|style| style.bg(rgb(0x8b494e)))
+                                    },
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(PromptResponse(index));
+                                }))
+                        }),
+                    )),
+            )
+    }
+}
+
 pub struct ClipboardView {
     monitor: ClipboardMonitor,
     storage: Option<Storage>,
@@ -246,7 +348,7 @@ impl ClipboardView {
             PromptLevel::Warning,
             "清空剪贴板历史？",
             Some("本地保存的全部记录都会删除。"),
-            &["取消", "清空"],
+            &[PromptButton::cancel("取消"), PromptButton::ok("清空")],
             cx,
         );
         cx.spawn(async move |view, cx| {
@@ -262,9 +364,10 @@ impl ClipboardView {
         .detach();
     }
 
-    fn button_base(label: &'static str) -> Stateful<Div> {
+    fn button_base(label: impl Into<SharedString>) -> Stateful<Div> {
+        let label = label.into();
         div()
-            .id(label)
+            .id(label.clone())
             .role(Role::Button)
             .aria_label(label)
             .flex_shrink_0()
@@ -274,8 +377,12 @@ impl ClipboardView {
             .cursor_pointer()
     }
 
-    fn button(label: &'static str) -> Stateful<Div> {
-        Self::button_base(label).px_3().py_1p5().child(label)
+    fn button(label: impl Into<SharedString>) -> Stateful<Div> {
+        let label = label.into();
+        Self::button_base(label.clone())
+            .px_3()
+            .py_1p5()
+            .child(label)
     }
 
     fn icon_button(label: &'static str, glyph: &'static str) -> Stateful<Div> {
@@ -384,7 +491,7 @@ impl ClipboardView {
                     .items_center()
                     .justify_between()
                     .child(div().text_base().child("设置"))
-                    .child(Self::button("返回历史").on_click(cx.listener(
+                    .child(Self::button("返回列表").on_click(cx.listener(
                         |view, _, window, cx| {
                             window.blur(cx);
                             view.settings_open = false;
@@ -556,11 +663,17 @@ impl ClipboardView {
 
         div()
             .id(("entry", id))
+            .role(Role::ListItem)
+            .aria_label(if preview.is_empty() {
+                SharedString::from("图片")
+            } else {
+                SharedString::from(preview.clone())
+            })
             .min_w_0()
             .w_full()
             .flex_shrink_0()
             .flex()
-            .items_start()
+            .items_center()
             .gap_3()
             .p_3()
             .rounded_md()
@@ -583,7 +696,7 @@ impl ClipboardView {
                         .tray
                         .as_ref()
                         .ok_or_else(|| "无法恢复原来的输入窗口".to_string())
-                        .and_then(|tray| tray.paste(|| view.monitor.copy_entry(id, window, cx)));
+                        .and_then(|tray| tray.paste(|| view.monitor.copy_entry(id, window)));
                     view.status = result
                         .err()
                         .map(|error| (format!("粘贴失败：{error}"), true));
@@ -615,10 +728,12 @@ impl ClipboardView {
             .child(
                 div()
                     .flex_shrink_0()
+                    .self_stretch()
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap_1()
+                    .justify_between()
+                    .gap_2()
                     .child(
                         div()
                             .whitespace_nowrap()
