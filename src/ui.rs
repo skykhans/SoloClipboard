@@ -466,6 +466,9 @@ impl ClipboardView {
                             }
                         };
                         view.settings_open = true;
+                        if let Some(tray) = &view.tray {
+                            tray.set_settings_open(true);
+                        }
                         cx.notify();
                     },
                 )))
@@ -498,6 +501,9 @@ impl ClipboardView {
                         |view, _, window, cx| {
                             window.blur(cx);
                             view.settings_open = false;
+                            if let Some(tray) = &view.tray {
+                                tray.set_settings_open(false);
+                            }
                             cx.notify();
                         },
                     ))),
@@ -590,15 +596,14 @@ impl ClipboardView {
                                     .tab_index(0)
                                     .focus(|style| style.bg(rgb(0x31564b)))
                                     .on_click(cx.listener(|view, _, window, cx| {
-                                        if !window.is_window_active() {
-                                            window.activate_window();
-                                        }
+                                        view.status = None;
                                         view.shortcut_focus.focus(window, cx);
                                         cx.notify();
                                     }))
                                     .on_key_down(cx.listener(
                                         |view, event: &KeyDownEvent, window, cx| {
                                             if event.keystroke.key == "escape" {
+                                                view.status = None;
                                                 window.blur(cx);
                                             } else if let Some(shortcut) =
                                                 Shortcut::from_keystroke(&event.keystroke)
@@ -612,7 +617,11 @@ impl ClipboardView {
                                                 );
                                                 window.blur(cx);
                                             } else {
-                                                return;
+                                                view.status = Some((
+                                                    "请用修饰键搭配字母、数字或功能键。F12 由 Windows 保留。"
+                                                        .into(),
+                                                    true,
+                                                ));
                                             }
                                             cx.stop_propagation();
                                             window.prevent_default();
@@ -620,6 +629,20 @@ impl ClipboardView {
                                         },
                                     )),
                             )
+                            .when(self.settings.shortcut != Some(Shortcut::WIN_V), |row| {
+                                row.child(Self::button("使用 Win + V").on_click(cx.listener(
+                                    |view, _, window, cx| {
+                                        window.blur(cx);
+                                        view.update_settings(
+                                            Settings {
+                                                shortcut: Some(Shortcut::WIN_V),
+                                                ..view.settings
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                )))
+                            })
                             .when(self.settings.shortcut.is_some(), |row| {
                                 row.child(Self::button("禁用").on_click(cx.listener(
                                     |view, _, window, cx| {

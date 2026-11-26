@@ -7,9 +7,10 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
-            INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-            MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
+            GetAsyncKeyState, GetKeyState, RegisterHotKey, SendInput, UnregisterHotKey, VkKeyScanW,
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL,
+            MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+            VK_V,
         },
         Shell::{
             DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON,
@@ -27,6 +28,7 @@ const EXIT_MENU: usize = 2;
 const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE: &str = "SoloClipboard";
 const FILE_NOT_FOUND_HRESULT: i32 = 0x80070002_u32 as i32;
+const VK_MENU_MASK: u16 = 0xe8;
 pub const STARTUP_ARG: &str = "--startup";
 
 pub fn starts_with_windows() -> Result<bool, String> {
@@ -70,6 +72,11 @@ pub struct Shortcut {
 }
 
 impl Shortcut {
+    pub const WIN_V: Self = Self {
+        modifiers: MOD_WIN,
+        key: VK_V as u32,
+    };
+
     pub fn from_keystroke(stroke: &Keystroke) -> Option<Self> {
         let keys = stroke.key.as_bytes();
         let key = match keys {
@@ -81,11 +88,24 @@ impl Shortcut {
                 }
                 0x70 + number - 1
             }
-            _ => return None,
+            _ => {
+                let mut characters = stroke.key.chars();
+                let character = u16::try_from(u32::from(characters.next()?)).ok()?;
+                if characters.next().is_some() {
+                    return None;
+                }
+                let key = unsafe { VkKeyScanW(character) } as u8;
+                if !key.is_ascii_digit() {
+                    return None;
+                }
+                u32::from(key)
+            }
         };
+        // GPUI can fold Shift into the character for number-row keys.
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
         let modifiers = u32::from(stroke.modifiers.control) * MOD_CONTROL
             | u32::from(stroke.modifiers.alt) * MOD_ALT
-            | u32::from(stroke.modifiers.shift) * MOD_SHIFT
+            | u32::from(shift) * MOD_SHIFT
             | u32::from(stroke.modifiers.platform) * MOD_WIN;
         (modifiers != 0).then_some(Self { modifiers, key })
     }
@@ -121,11 +141,128 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             close_to_tray: false,
-            shortcut: Some(Shortcut {
-                modifiers: MOD_CONTROL | MOD_ALT,
-                key: u32::from(b'V'),
-            }),
+            shortcut: Some(Shortcut::WIN_V),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RegisteredShortcut {
+    id: i32,
+    shortcut: Shortcut,
+    hook: Option<HHOOK>,
+}
+
+impl RegisteredShortcut {
+    fn register(hwnd: HWND, id: i32, shortcut: Shortcut) -> io::Result<Self> {
+        let hook = if shortcut == Shortcut::WIN_V {
+            let hook = unsafe {
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(win_v_proc),
+                    GetModuleHandleW(ptr::null()),
+                    0,
+                )
+            };
+            if hook.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            WIN_V_TARGET.set(Some(WinVTarget {
+                hwnd,
+                id,
+                v_down: false,
+            }));
+            Some(hook)
+        } else {
+            if unsafe { RegisterHotKey(hwnd, id, shortcut.modifiers | MOD_NOREPEAT, shortcut.key) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            None
+        };
+        Ok(Self { id, shortcut, hook })
+    }
+
+    fn unregister(self, hwnd: HWND) {
+        unsafe {
+            if let Some(hook) = self.hook {
+                WIN_V_TARGET.set(None);
+                UnhookWindowsHookEx(hook);
+            } else {
+                UnregisterHotKey(hwnd, self.id);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WinVTarget {
+    hwnd: HWND,
+    id: i32,
+    v_down: bool,
+}
+
+thread_local! {
+    static WIN_V_TARGET: Cell<Option<WinVTarget>> = const { Cell::new(None) };
+}
+
+unsafe extern "system" fn win_v_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32
+        && unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode } == u32::from(VK_V)
+        && WIN_V_TARGET.with(|target| {
+            let Some(mut state) = target.get() else {
+                return false;
+            };
+            match wparam as u32 {
+                WM_KEYUP | WM_SYSKEYUP if state.v_down => {
+                    state.v_down = false;
+                    target.set(Some(state));
+                    true
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN if state.v_down => true,
+                WM_KEYDOWN | WM_SYSKEYDOWN if win_v_modifiers_down() => {
+                    state.v_down = true;
+                    target.set(Some(state));
+                    // Prevent the Win release from opening Start after swallowing V.
+                    let mask = [
+                        keyboard_input(VK_MENU_MASK, 0),
+                        keyboard_input(VK_MENU_MASK, KEYEVENTF_KEYUP),
+                    ];
+                    unsafe {
+                        SendInput(
+                            mask.len() as u32,
+                            mask.as_ptr(),
+                            mem::size_of::<INPUT>() as i32,
+                        );
+                        PostMessageW(state.hwnd, WM_HOTKEY, state.id as usize, 0);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        })
+    {
+        return 1;
+    }
+    unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
+}
+
+fn win_v_modifiers_down() -> bool {
+    let down = |key| unsafe { GetAsyncKeyState(i32::from(key)) < 0 };
+    (down(VK_LWIN) || down(VK_RWIN)) && !down(VK_CONTROL) && !down(VK_MENU) && !down(VK_SHIFT)
+}
+
+fn keyboard_input(key: u16, flags: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
     }
 }
 
@@ -138,7 +275,7 @@ struct WindowState {
     has_icon: Cell<bool>,
     close_to_tray: Cell<bool>,
     exiting: Cell<bool>,
-    hotkey: Cell<Option<(i32, Shortcut)>>,
+    hotkey: Cell<Option<RegisteredShortcut>>,
     paste_target: Cell<HWND>,
 }
 
@@ -184,8 +321,7 @@ impl TrayWindow {
             if !tray.0.add_icon() {
                 return Err("无法添加通知区域图标".into());
             }
-            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+            tray.set_settings_open(false);
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as LPARAM);
             let large = LoadIconW(instance, ICON_RESOURCE);
             SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as LPARAM);
@@ -231,16 +367,7 @@ impl TrayWindow {
                 (VK_V, KEYEVENTF_KEYUP),
                 (VK_CONTROL, KEYEVENTF_KEYUP),
             ]
-            .map(|(key, flags)| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: key,
-                        dwFlags: flags,
-                        ..Default::default()
-                    },
-                },
-            });
+            .map(|(key, flags)| keyboard_input(key, flags));
             if SendInput(
                 keys.len() as u32,
                 keys.as_ptr(),
@@ -249,13 +376,33 @@ impl TrayWindow {
             {
                 return Err("无法向原来的输入窗口发送粘贴操作".into());
             }
-            ShowWindow(self.0.hwnd.get(), SW_HIDE);
         }
+        self.0.hide();
         Ok(())
     }
 
     pub fn set_close_to_tray(&self, enabled: bool) {
         self.0.close_to_tray.set(enabled);
+    }
+
+    pub fn set_settings_open(&self, open: bool) {
+        let hwnd = self.0.hwnd.get();
+        let no_activate = WS_EX_NOACTIVATE as isize;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let style = if open {
+                style & !no_activate
+            } else {
+                style | no_activate
+            };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+            if !open && GetForegroundWindow() == hwnd {
+                let target = self.0.paste_target.get();
+                if !target.is_null() {
+                    SetForegroundWindow(target);
+                }
+            }
+        }
     }
 
     pub fn set_shortcut(
@@ -264,36 +411,31 @@ impl TrayWindow {
         save: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         let previous = self.0.hotkey.get();
-        if previous.map(|(_, shortcut)| shortcut) == shortcut {
+        if previous.map(|registered| registered.shortcut) == shortcut {
             return save();
         }
         let hwnd = self.0.hwnd.get();
-        let id = if previous.is_some_and(|(id, _)| id == 1) {
+        let id = if previous.is_some_and(|registered| registered.id == 1) {
             2
         } else {
             1
         };
-        if let Some(shortcut) = shortcut {
-            if unsafe { RegisterHotKey(hwnd, id, shortcut.modifiers | MOD_NOREPEAT, shortcut.key) }
-                == 0
-            {
-                return Err(format!(
-                    "无法注册快捷键 {}：{}",
-                    shortcut.label(),
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        let registered = shortcut
+            .map(|shortcut| {
+                RegisteredShortcut::register(hwnd, id, shortcut)
+                    .map_err(|error| format!("无法注册快捷键 {}：{error}", shortcut.label()))
+            })
+            .transpose()?;
         if let Err(error) = save() {
-            if shortcut.is_some() {
-                unsafe { UnregisterHotKey(hwnd, id) };
+            if let Some(registered) = registered {
+                registered.unregister(hwnd);
             }
             return Err(error);
         }
-        if let Some((id, _)) = previous {
-            unsafe { UnregisterHotKey(hwnd, id) };
+        if let Some(previous) = previous {
+            previous.unregister(hwnd);
         }
-        self.0.hotkey.set(shortcut.map(|shortcut| (id, shortcut)));
+        self.0.hotkey.set(registered);
         Ok(())
     }
 }
@@ -348,15 +490,15 @@ impl WindowState {
             if self.has_icon.replace(false) {
                 Shell_NotifyIconW(NIM_DELETE, &self.icon_data());
             }
-            if let Some((id, _)) = self.hotkey.take() {
-                UnregisterHotKey(hwnd, id);
+            if let Some(registered) = self.hotkey.take() {
+                registered.unregister(hwnd);
             }
             RemoveWindowSubclass(hwnd, Some(window_proc), 1);
         }
         self.hwnd.set(ptr::null_mut());
     }
 
-    fn show(&self) {
+    fn show(&self, z_order: HWND) {
         let hwnd = self.hwnd.get();
         unsafe {
             self.remember_paste_target(GetForegroundWindow());
@@ -368,7 +510,23 @@ impl WindowState {
             ShowWindow(hwnd, command);
             SetWindowPos(
                 hwnd,
-                HWND_TOP,
+                z_order,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn hide(&self) {
+        let hwnd = self.hwnd.get();
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+            SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
                 0,
                 0,
                 0,
@@ -411,7 +569,7 @@ impl WindowState {
             }
             PostMessageW(hwnd, WM_NULL, 0, 0);
             match command as usize {
-                OPEN_MENU => self.show(),
+                OPEN_MENU => self.show(HWND_TOP),
                 EXIT_MENU => {
                     self.exiting.set(true);
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -437,12 +595,18 @@ unsafe extern "system" fn window_proc(
         Rc::from_raw(state_ptr)
     };
     match message {
-        WM_MOUSEACTIVATE if lparam as u16 == HTCLIENT as u16 => return MA_NOACTIVATE as LRESULT,
+        WM_MOUSEACTIVATE
+            if lparam as u16 == HTCLIENT as u16
+                && unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } & WS_EX_NOACTIVATE as isize
+                    != 0 =>
+        {
+            return MA_NOACTIVATE as LRESULT;
+        }
         WM_ACTIVATE if wparam as u16 != WA_INACTIVE as u16 => {
             state.remember_paste_target(lparam as HWND);
         }
         WM_SYSCOMMAND if wparam & 0xfff0 == SC_MINIMIZE as usize && state.has_icon.get() => {
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+            state.hide();
             return 0;
         }
         WM_SIZE if wparam == SIZE_MINIMIZED as usize && state.has_icon.get() => {
@@ -450,17 +614,17 @@ unsafe extern "system" fn window_proc(
         }
         HIDE_MINIMIZED => {
             if state.has_icon.get() && unsafe { IsIconic(hwnd) } != 0 {
-                unsafe { ShowWindow(hwnd, SW_HIDE) };
+                state.hide();
             }
             return 0;
         }
         WM_CLOSE if state.close_to_tray.get() && state.has_icon.get() && !state.exiting.get() => {
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+            state.hide();
             return 0;
         }
         TRAY_MESSAGE => {
             match lparam as u32 {
-                WM_LBUTTONUP => state.show(),
+                WM_LBUTTONUP => state.show(HWND_TOP),
                 WM_RBUTTONUP => state.menu(),
                 _ => {}
             }
@@ -470,15 +634,15 @@ unsafe extern "system" fn window_proc(
             if state
                 .hotkey
                 .get()
-                .is_some_and(|(id, _)| id as usize == wparam) =>
+                .is_some_and(|registered| registered.id as usize == wparam) =>
         {
-            state.show();
+            state.show(HWND_TOPMOST);
             return 0;
         }
         WM_NCDESTROY => state.detach(),
         message if message == state.taskbar_created && message != 0 => {
             if !state.add_icon() {
-                state.show();
+                state.show(HWND_TOP);
             }
             return 0;
         }
