@@ -1,84 +1,206 @@
-use clipboard_win::{formats, get_clipboard_string, set_clipboard_string};
-use parking_lot::RwLock;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use clipboard_win::{formats::CF_DIB, raw, Clipboard};
+use gpui::{App, ClipboardEntry as SystemEntry, ClipboardItem, Image, ImageFormat, Window};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::cell::OnceCell;
+use std::collections::HashSet;
+use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
-pub struct ClipboardMonitor {
-    history: Arc<RwLock<Vec<ClipboardEntry>>>,
-    last_content: Arc<RwLock<String>>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClipboardEntry {
     pub content: String,
     pub timestamp: chrono::DateTime<chrono::Local>,
     pub id: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ClipboardImage>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ClipboardImage {
+    mime: String,
+    data: String,
+    #[serde(skip)]
+    image: OnceCell<Option<Arc<Image>>>,
+}
+
+impl ClipboardImage {
+    pub fn load(&self) -> Option<Arc<Image>> {
+        self.image
+            .get_or_init(|| {
+                let format = ImageFormat::from_mime_type(&self.mime)?;
+                let bytes = STANDARD.decode(&self.data).ok()?;
+                Some(Arc::new(Image::from_bytes(format, bytes)))
+            })
+            .clone()
+    }
+}
+
+pub struct ClipboardMonitor {
+    pub history: Vec<ClipboardEntry>,
+    sequence: Option<NonZeroU32>,
+    next_id: usize,
 }
 
 impl ClipboardMonitor {
-    pub fn new() -> Self {
+    pub fn new(mut history: Vec<ClipboardEntry>) -> Self {
+        // Older files can contain duplicate IDs after deletions.
+        for (id, entry) in history.iter_mut().enumerate() {
+            entry.id = id;
+        }
         Self {
-            history: Arc::new(RwLock::new(Vec::new())),
-            last_content: Arc::new(RwLock::new(String::new())),
+            next_id: history.len(),
+            sequence: None,
+            history,
         }
     }
 
-    pub fn start_monitoring(&self) {
-        let history = Arc::clone(&self.history);
-        let last_content = Arc::clone(&self.last_content);
-
-        thread::spawn(move || {
-            loop {
-                if let Ok(content) = get_clipboard_string() {
-                    let last = last_content.read().clone();
-
-                    if !content.is_empty() && content != last {
-                        let mut history_lock = history.write();
-                        let id = history_lock.len();
-
-                        let entry = ClipboardEntry {
-                            content: content.clone(),
-                            timestamp: chrono::Local::now(),
-                            id,
-                        };
-
-                        history_lock.push(entry);
-                        *last_content.write() = content;
-                    }
-                }
-
-                thread::sleep(Duration::from_millis(500));
-            }
+    pub fn capture(&mut self, cx: &App) -> bool {
+        let sequence = clipboard_win::seq_num();
+        if sequence.is_none() || sequence == self.sequence {
+            return false;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        self.sequence = sequence;
+        let content = item.text().unwrap_or_default();
+        let image = item.entries().iter().find_map(|entry| match entry {
+            SystemEntry::Image(image) => Some(image),
+            _ => None,
         });
+        if content.is_empty() && image.is_none() {
+            return false;
+        }
+        if self.history.last().is_some_and(|last| {
+            last.content.replace("\r\n", "\n") == content
+                && last
+                    .image
+                    .as_ref()
+                    .and_then(ClipboardImage::load)
+                    .as_deref()
+                    == image
+        }) {
+            return false;
+        }
+        self.history.push(ClipboardEntry {
+            content,
+            image: image.map(|image| ClipboardImage {
+                mime: image.format.mime_type().to_owned(),
+                data: STANDARD.encode(&image.bytes),
+                image: OnceCell::from(Some(Arc::new(image.clone()))),
+            }),
+            timestamp: chrono::Local::now(),
+            id: self.next_id,
+        });
+        self.next_id += 1;
+        true
     }
 
-    pub fn get_history(&self) -> Vec<ClipboardEntry> {
-        self.history.read().clone()
-    }
-
-    pub fn copy_to_clipboard(&self, content: &str) -> Result<(), String> {
-        set_clipboard_string(content).map_err(|e| e.to_string())?;
-        *self.last_content.write() = content.to_string();
+    pub fn copy_entry(&mut self, id: usize, window: &Window, cx: &App) -> Result<(), String> {
+        let Some(entry) = self.history.iter().find(|entry| entry.id == id) else {
+            return Ok(());
+        };
+        if let Some(image) = &entry.image {
+            let image = image.load().ok_or("图片数据无法读取")?;
+            write_image(&image, window)?;
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(entry.content.clone()));
+        }
+        self.sequence = clipboard_win::seq_num();
         Ok(())
     }
 
-    pub fn clear_history(&self) {
-        self.history.write().clear();
+    pub fn import(&mut self, incoming: Vec<ClipboardEntry>) -> usize {
+        // IDs are local to each history file. Deduplicate by time and content.
+        let accepted: Vec<_> = {
+            let mut known: HashSet<_> = self.history.iter().map(ClipboardEntry::key).collect();
+            incoming
+                .iter()
+                .map(|entry| known.insert(entry.key()))
+                .collect()
+        };
+        let previous_count = self.history.len();
+        for (mut entry, accepted) in incoming.into_iter().zip(accepted) {
+            if accepted {
+                entry.id = self.next_id;
+                self.next_id += 1;
+                self.history.push(entry);
+            }
+        }
+        self.history.sort_by_key(|entry| entry.timestamp);
+        self.history.len() - previous_count
     }
+}
 
-    pub fn delete_entry(&self, id: usize) {
-        let mut history = self.history.write();
-        history.retain(|entry| entry.id != id);
+fn write_image(image: &Image, window: &Window) -> Result<(), String> {
+    let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err("无法获取 Windows 窗口句柄".into());
+    };
+    let clipboard_format = |name| {
+        raw::register_format(name)
+            .map(NonZeroU32::get)
+            .ok_or_else(|| format!("无法注册剪贴板格式 {name}"))
+    };
+    let native_format = match image.format {
+        ImageFormat::Svg => Some(clipboard_format("image/svg+xml")?),
+        ImageFormat::Gif => Some(clipboard_format("GIF")?),
+        ImageFormat::Jpeg => Some(clipboard_format("JFIF")?),
+        _ => None,
+    };
+
+    let mut png = Vec::new();
+    let mut bmp = Vec::new();
+    let png_format = if image.format == ImageFormat::Svg {
+        None
+    } else {
+        let raster = image::load_from_memory(image.bytes()).map_err(|error| error.to_string())?;
+        if image.format != ImageFormat::Png {
+            raster
+                .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+                .map_err(|error| error.to_string())?;
+        }
+        let rgb = raster.into_rgb8();
+        image::codecs::bmp::BmpEncoder::new(&mut bmp)
+            .encode(
+                &rgb,
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|error| error.to_string())?;
+        Some(clipboard_format("PNG")?)
+    };
+
+    let _clipboard =
+        Clipboard::new_for(handle.hwnd.get() as _).map_err(|error| error.to_string())?;
+    raw::empty().map_err(|error| error.to_string())?;
+    if let Some(format) = native_format {
+        raw::set_without_clear(format, image.bytes()).map_err(|error| error.to_string())?;
     }
-
-    pub fn delete_entries(&self, ids: &[usize]) {
-        let mut history = self.history.write();
-        history.retain(|entry| !ids.contains(&entry.id));
+    if let Some(format) = png_format {
+        let png = if image.format == ImageFormat::Png {
+            image.bytes()
+        } else {
+            &png
+        };
+        raw::set_without_clear(format, png).map_err(|error| error.to_string())?;
+        // CF_DIB uses the BMP data without the 14-byte file header.
+        raw::set_without_clear(CF_DIB, &bmp[14..]).map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
 
-    pub fn delete_all_before(&self, timestamp: chrono::DateTime<chrono::Local>) {
-        let mut history = self.history.write();
-        history.retain(|entry| entry.timestamp > timestamp);
+impl ClipboardEntry {
+    fn key(&self) -> (chrono::DateTime<chrono::Local>, &str, Option<(&str, &str)>) {
+        (
+            self.timestamp,
+            &self.content,
+            self.image
+                .as_ref()
+                .map(|image| (image.mime.as_str(), image.data.as_str())),
+        )
     }
 }

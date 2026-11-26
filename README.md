@@ -25,9 +25,10 @@
 
 ### 前置要求
 
-- Rust 1.70+ (推荐使用 rustup 安装)
+- rustup（项目使用 Rust 1.100.0）
 - Windows 10/11
 - Git
+- Zed 源码放在 `SoloClipboard` 的同级目录 `zed` 下，包含 `crates/gpui` 和 `crates/gpui_windows`
 
 ### 编译
 

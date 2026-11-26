@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on package cache
+    Updating crates.io index
+    Updating git repository `https://github.com/zed-industries/zed`
+warning: spurious network error (3 tries remaining): failed to send request: 操作超时
+; class=Os (2)
+warning: spurious network error (2 tries remaining): failed to send request: 操作超时
+; class=Os (2)
+warning: spurious network error (1 try remaining): failed to send request: 操作超时
+; class=Os (2)
+error: failed to get `gpui` as a dependency of package `solo_clipboard v0.1.0 (C:\Test\SoloClipboard)`
+
+Caused by:
+  failed to load source for dependency `gpui`
+
+Caused by:
+  unable to update https://github.com/zed-industries/zed?branch=main
+
+Caused by:
+  failed to fetch into: C:\Users\susq\.cargo\git\db\zed-a70e2ad075855582
+
+Caused by:
+  failed to send request: 操作超时
+  ; class=Os (2)
