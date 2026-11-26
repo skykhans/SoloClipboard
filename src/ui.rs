@@ -2,13 +2,54 @@ use crate::clipboard::{ClipboardEntry, ClipboardMonitor};
 use crate::desktop::{self, Settings, Shortcut, TrayWindow};
 use crate::search::SearchInput;
 use crate::storage::Storage;
+use chrono::NaiveDate;
 use gpui::{prelude::*, *};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::HWND;
+
+fn search_highlights(text: &str, query: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let lowercase = text.to_lowercase();
+    let mut matches = lowercase.match_indices(query).peekable();
+    if matches.peek().is_none() {
+        return Vec::new();
+    }
+
+    // Lowercasing can change a character's byte length.
+    let source_ranges: Vec<_> = text
+        .char_indices()
+        .flat_map(|(start, character)| {
+            let range = start..start + character.len_utf8();
+            let lowercase_len = character.to_lowercase().map(char::len_utf8).sum();
+            std::iter::repeat_n(range, lowercase_len)
+        })
+        .collect();
+    let style = HighlightStyle {
+        color: Some(rgb(0x241c0b).into()),
+        background_color: Some(rgb(0xffcf66).into()),
+        ..Default::default()
+    };
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for (start, matched) in matches {
+        let range = source_ranges[start].start..source_ranges[start + matched.len() - 1].end;
+        if let Some((previous, _)) = highlights
+            .last_mut()
+            .filter(|(previous, _)| previous.end >= range.start)
+        {
+            previous.end = range.end;
+        } else {
+            highlights.push((range, style));
+        }
+    }
+    highlights
+}
 
 struct ToolbarTooltip(&'static str);
 
@@ -132,10 +173,11 @@ pub struct ClipboardView {
     storage: Option<Storage>,
     search: Entity<SearchInput>,
     history_scroll: ScrollHandle,
+    date_menu: Option<Bounds<Pixels>>,
     scrollbar_drag: Rc<Cell<Option<Pixels>>>,
     selection: Option<HashSet<usize>>,
     status: Option<(String, bool)>,
-    export_status_timeout: Option<Task<()>>,
+    status_timeout: Option<Task<()>>,
     tray: Option<TrayWindow>,
     settings: Settings,
     settings_open: bool,
@@ -176,13 +218,18 @@ impl ClipboardView {
             }
         });
         let search = cx.new(SearchInput::new);
-        let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
-        let escape_subscription = cx.observe_keystrokes(|view, event, window, _| {
+        let search_subscription = cx.observe(&search, |view, _, cx| {
+            view.date_menu = None;
+            cx.notify();
+        });
+        let escape_subscription = cx.observe_keystrokes(|view, event, window, cx| {
             if event.keystroke.key == "escape"
                 && event.keystroke.modifiers == Modifiers::default()
                 && !window.has_active_prompt()
             {
-                if let Some(tray) = &view.tray {
+                if view.date_menu.take().is_some() {
+                    cx.notify();
+                } else if let Some(tray) = &view.tray {
                     tray.hide();
                 }
             }
@@ -212,10 +259,11 @@ impl ClipboardView {
             storage,
             search,
             history_scroll: ScrollHandle::new(),
+            date_menu: None,
             scrollbar_drag: Rc::default(),
             selection: None,
             status,
-            export_status_timeout: None,
+            status_timeout: None,
             tray,
             settings,
             settings_open: false,
@@ -373,6 +421,28 @@ impl ClipboardView {
         cx.notify();
     }
 
+    fn save_history_change(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        self.persist(cx);
+    }
+
+    fn set_transfer_status(&mut self, status: (String, bool), cx: &mut Context<Self>) {
+        let success = !status.1;
+        self.status = Some(status);
+        self.status_timeout = success.then(|| {
+            cx.spawn(async move |view, cx| {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = view.update(cx, |view, cx| {
+                    if matches!(view.status, Some((_, false))) {
+                        view.status = None;
+                        cx.notify();
+                    }
+                });
+            })
+        });
+        cx.notify();
+    }
+
     fn import(&mut self, cx: &mut Context<Self>) {
         let choice = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -382,34 +452,28 @@ impl ClipboardView {
         });
         cx.spawn(async move |view, cx| {
             let result = match choice.await {
-                Ok(Ok(Some(paths))) => {
-                    if let Some(path) = paths.into_iter().next() {
-                        cx.background_executor()
-                            .spawn(async move {
-                                Storage::read(&path).map_err(|error| error.to_string())
-                            })
-                            .await
-                    } else {
+                Ok(Ok(paths)) => {
+                    let Some(path) = paths.and_then(|paths| paths.into_iter().next()) else {
                         return;
-                    }
+                    };
+                    cx.background_executor()
+                        .spawn(
+                            async move { Storage::read(&path).map_err(|error| error.to_string()) },
+                        )
+                        .await
                 }
-                Ok(Ok(None)) => return,
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
-            let _ = view.update(cx, |view, cx| {
-                match result {
-                    Ok(history) => {
-                        let count = view.monitor.import(history);
-                        view.status = Some((format!("已导入 {count} 条新记录"), false));
-                        view.dirty |= count > 0;
-                        if view.dirty {
-                            view.persist(cx);
-                        }
+            let _ = view.update(cx, |view, cx| match result {
+                Ok(history) => {
+                    let count = view.monitor.import(history);
+                    view.set_transfer_status((format!("已导入 {count} 条新记录"), false), cx);
+                    if count > 0 || view.dirty {
+                        view.save_history_change(cx);
                     }
-                    Err(error) => view.status = Some((format!("导入失败：{error}"), true)),
                 }
-                cx.notify();
+                Err(error) => view.set_transfer_status((format!("导入失败：{error}"), true), cx),
             });
         })
         .detach();
@@ -435,19 +499,7 @@ impl ClipboardView {
                     Ok(Err(error)) => (format!("导出失败：{error}"), true),
                     Err(error) => (format!("导出失败：{error}"), true),
                 };
-                view.status = Some(status.clone());
-                view.export_status_timeout = (!status.1).then(|| {
-                    cx.spawn(async move |view, cx| {
-                        cx.background_executor().timer(Duration::from_secs(3)).await;
-                        let _ = view.update(cx, |view, cx| {
-                            if view.status.as_ref() == Some(&status) {
-                                view.status = None;
-                                cx.notify();
-                            }
-                        });
-                    })
-                });
-                cx.notify();
+                view.set_transfer_status(status, cx);
             });
         })
         .detach();
@@ -458,8 +510,7 @@ impl ClipboardView {
             self.monitor
                 .history
                 .retain(|entry| !selection.contains(&entry.id));
-            self.dirty = true;
-            self.persist(cx);
+            self.save_history_change(cx);
         }
     }
 
@@ -479,8 +530,7 @@ impl ClipboardView {
                 let _ = view.update(cx, |view, cx| {
                     view.monitor.history.clear();
                     view.selection = None;
-                    view.dirty = true;
-                    view.persist(cx);
+                    view.save_history_change(cx);
                 });
             }
         })
@@ -595,6 +645,25 @@ impl ClipboardView {
             })
     }
 
+    fn settings_section(title: &'static str) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .bg(rgb(0x252831))
+            .p_3()
+            .child(title)
+    }
+
+    fn setting_option(label: &'static str, selected: bool) -> Stateful<Div> {
+        Self::button(label).when(selected, |button| {
+            button
+                .bg(rgb(0x31564b))
+                .hover(|style| style.bg(rgb(0x31564b)))
+        })
+    }
+
     fn settings(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let recording = self.shortcut_focus.is_focused(window);
         let shortcut_label = self
@@ -629,23 +698,11 @@ impl ClipboardView {
                     ))),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .rounded_md()
-                    .bg(rgb(0x252831))
-                    .p_3()
-                    .child("开机启动")
+                Self::settings_section("开机启动")
                     .when_some(self.start_with_windows, |section, enabled| {
                         section.child(div().flex().gap_2().children(
                             [("关闭", false), ("开启", true)].map(|(label, selected)| {
-                                Self::button(label)
-                                    .when(enabled == selected, |button| {
-                                        button
-                                            .bg(rgb(0x31564b))
-                                            .hover(|style| style.bg(rgb(0x31564b)))
-                                    })
+                                Self::setting_option(label, enabled == selected)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         match desktop::set_start_with_windows(selected) {
                                             Ok(()) => {
@@ -666,23 +723,11 @@ impl ClipboardView {
                     }),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .rounded_md()
-                    .bg(rgb(0x252831))
-                    .p_3()
-                    .child("关闭窗口时")
+                Self::settings_section("关闭窗口时")
                     .child(div().flex().flex_wrap().gap_2().children(
-                        [("退出程序", false), ("留在通知区域", true)].map(
+                        [("最小化到通知区域", true), ("退出程序", false)].map(
                             |(label, close_to_tray)| {
-                                Self::button(label)
-                                    .when(self.settings.close_to_tray == close_to_tray, |button| {
-                                        button
-                                            .bg(rgb(0x31564b))
-                                            .hover(|style| style.bg(rgb(0x31564b)))
-                                    })
+                                Self::setting_option(label, self.settings.close_to_tray == close_to_tray)
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         view.update_settings(
                                             Settings {
@@ -697,14 +742,7 @@ impl ClipboardView {
                     )),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .rounded_md()
-                    .bg(rgb(0x252831))
-                    .p_3()
-                    .child("打开剪贴板的全局快捷键")
+                Self::settings_section("打开剪贴板的全局快捷键")
                     .child(
                         div()
                             .flex()
@@ -793,7 +831,132 @@ impl ClipboardView {
             )
     }
 
-    fn history_item(&self, entry: &ClipboardEntry, cx: &Context<Self>) -> impl IntoElement {
+    fn history_date(date: NaiveDate, index: usize, view: WeakEntity<Self>) -> Stateful<Div> {
+        let label = date.to_string();
+        Self::button_base(label.clone())
+            .bg(rgb(0x21252d))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(0xc2cadd))
+            .child(label)
+            .child(div().font_family("Segoe MDL2 Assets").child("\u{e70d}"))
+            .on_click(move |_, _, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    let scroll = &view.history_scroll;
+                    view.date_menu = scroll.bounds_for_item(index).map(|mut bounds| {
+                        bounds.origin += scroll.offset();
+                        bounds.origin.y = bounds.origin.y.max(scroll.bounds().top());
+                        bounds
+                    });
+                    cx.notify();
+                });
+            })
+    }
+
+    fn sticky_history_date(
+        &self,
+        dates: Vec<(NaiveDate, usize)>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let scroll = self.history_scroll.clone();
+        let view = cx.weak_entity();
+        canvas(
+            move |_, window, cx| {
+                // The scroll list has already laid out its rows and applied the current offset.
+                let viewport = scroll.bounds();
+                let top = viewport.top() - scroll.offset().y;
+                let visible = dates.partition_point(|&(_, index)| {
+                    scroll
+                        .bounds_for_item(index)
+                        .is_some_and(|bounds| bounds.top() <= top)
+                });
+                let &(date, index) = dates[..visible].last()?;
+                let bounds = scroll.bounds_for_item(index)?;
+                if bounds.top() == top {
+                    return None;
+                }
+                let mut header = div()
+                    .w(bounds.size.width)
+                    .bg(rgb(0x1b1e25))
+                    .child(Self::history_date(date, index, view).block_mouse_except_scroll())
+                    .into_any_element();
+                header.prepaint_as_root(
+                    point(bounds.left(), viewport.top()),
+                    bounds.size.into(),
+                    window,
+                    cx,
+                );
+                Some(header)
+            },
+            |_, header, window, cx| {
+                if let Some(mut header) = header {
+                    header.paint(window, cx);
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    fn history_date_menu(
+        anchor: Bounds<Pixels>,
+        dates: &[(NaiveDate, usize)],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .child(div().absolute().inset_0().occlude().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.date_menu = None;
+                    cx.notify();
+                }),
+            ))
+            .child(deferred(
+                anchored()
+                    .attach(anchor, Anchor::BottomLeft)
+                    .offset(point(px(0.), px(4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .id("history-date-menu")
+                            .aria_label("跳转到日期")
+                            .occlude()
+                            .w(px(148.))
+                            .max_h(px(224.))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .p_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x393e4a))
+                            .bg(rgb(0x252831))
+                            .shadow_lg()
+                            .children(dates.iter().map(|&(date, index)| {
+                                Self::button(date.to_string()).bg(rgb(0x252831)).on_click(
+                                    cx.listener(move |view, _, _, cx| {
+                                        view.date_menu = None;
+                                        view.history_scroll.scroll_to_top_of_item(index);
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                    ),
+            ))
+    }
+
+    fn history_item(
+        &self,
+        entry: &ClipboardEntry,
+        query: &str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let id = entry.id;
         let (pin_label, pin_icon) = if entry.pinned {
             ("取消置顶", "\u{e77a}")
@@ -804,11 +967,14 @@ impl ClipboardView {
             .selection
             .as_ref()
             .is_some_and(|selection| selection.contains(&id));
-        let preview = match entry.content.char_indices().nth(500) {
-            Some((end, _)) => format!("{}…", &entry.content[..end]),
-            None => entry.content.clone(),
+        let end = entry.content.char_indices().nth(500);
+        let mut preview = end
+            .map_or(entry.content.as_str(), |(end, _)| &entry.content[..end])
+            .replace('\t', "    ");
+        let highlights = search_highlights(&preview, query);
+        if end.is_some() {
+            preview.push('…');
         }
-        .replace('\t', "    ");
 
         div()
             .id(("entry", id))
@@ -839,7 +1005,6 @@ impl ClipboardView {
                     if !selection.remove(&id) {
                         selection.insert(id);
                     }
-                    cx.notify();
                 } else {
                     let result = view
                         .tray
@@ -849,8 +1014,8 @@ impl ClipboardView {
                     view.status = result
                         .err()
                         .map(|error| (format!("粘贴失败：{error}"), true));
-                    cx.notify();
                 }
+                cx.notify();
             }))
             .child(
                 div()
@@ -871,7 +1036,11 @@ impl ClipboardView {
                         },
                     )
                     .when(!preview.is_empty(), |content| {
-                        content.child(div().line_clamp(3).child(preview))
+                        content.child(
+                            div()
+                                .line_clamp(3)
+                                .child(StyledText::new(preview).with_highlights(highlights)),
+                        )
                     }),
             )
             .child(
@@ -888,54 +1057,55 @@ impl ClipboardView {
                             .whitespace_nowrap()
                             .text_xs()
                             .text_color(rgb(0xaab2c3))
-                            .child(entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string()),
+                            .child(entry.timestamp.format("%H:%M:%S").to_string()),
                     )
-                    .when(self.selection.is_some(), |row| {
-                        row.child(div().text_color(rgb(0x87baff)).child(if selected {
-                            "☑"
-                        } else {
-                            "☐"
-                        }))
-                    })
-                    .when(self.selection.is_none(), |details| {
-                        details.child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .child(
-                                    Self::icon_button(pin_label, pin_icon)
-                                        .size(px(28.))
-                                        .when(entry.pinned, |button| {
-                                            button
-                                                .bg(rgb(0x31564b))
-                                                .hover(|style| style.bg(rgb(0x406a5e)))
-                                        })
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(entry) = view
-                                                .monitor
-                                                .history
-                                                .iter_mut()
-                                                .find(|entry| entry.id == id)
-                                            {
-                                                entry.pinned = !entry.pinned;
-                                                view.dirty = true;
-                                                view.persist(cx);
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Self::icon_button("删除", "\u{e74d}")
-                                        .size(px(28.))
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            cx.stop_propagation();
-                                            view.monitor.history.retain(|entry| entry.id != id);
-                                            view.dirty = true;
-                                            view.persist(cx);
-                                        })),
-                                ),
-                        )
-                    }),
+                    .when_else(
+                        self.selection.is_some(),
+                        |row| {
+                            row.child(div().text_color(rgb(0x87baff)).child(if selected {
+                                "☑"
+                            } else {
+                                "☐"
+                            }))
+                        },
+                        |details| {
+                            details.child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        Self::icon_button(pin_label, pin_icon)
+                                            .size(px(28.))
+                                            .when(entry.pinned, |button| {
+                                                button
+                                                    .bg(rgb(0x31564b))
+                                                    .hover(|style| style.bg(rgb(0x406a5e)))
+                                            })
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(entry) = view
+                                                    .monitor
+                                                    .history
+                                                    .iter_mut()
+                                                    .find(|entry| entry.id == id)
+                                                {
+                                                    entry.pinned = !entry.pinned;
+                                                    view.save_history_change(cx);
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        Self::icon_button("删除", "\u{e74d}")
+                                            .size(px(28.))
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                cx.stop_propagation();
+                                                view.monitor.history.retain(|entry| entry.id != id);
+                                                view.save_history_change(cx);
+                                            })),
+                                    ),
+                            )
+                        },
+                    ),
             )
     }
 }
@@ -943,18 +1113,8 @@ impl ClipboardView {
 impl Render for ClipboardView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).text.trim().to_lowercase();
-        let matching = self.monitor.history.iter().rev().filter(|entry| {
-            query.is_empty()
-                || entry.content.to_lowercase().contains(&query)
-                || (entry.image.is_some() && ("图片".contains(&query) || "image".contains(&query)))
-        });
-        let mut entries = matching
-            .clone()
-            .filter(|entry| entry.pinned)
-            .chain(matching.filter(|entry| !entry.pinned))
-            .peekable();
-        let empty = entries.peek().is_none();
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -962,45 +1122,85 @@ impl Render for ClipboardView {
             .bg(rgb(0x1b1e25))
             .text_color(rgb(0xe8ebf2))
             .text_sm()
-            .when(self.settings_open, |view| {
-                view.child(self.settings(window, cx))
-            })
-            .when(!self.settings_open, |view| {
-                view.child(self.toolbar(cx)).child(
-                    div()
-                        .relative()
-                        .min_h_0()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
+            .when_else(
+                self.settings_open,
+                |view| view.child(self.settings(window, cx)),
+                |view| {
+                    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                    for entry in self.monitor.history.iter().rev().filter(|entry| {
+                        query.is_empty()
+                            || entry.content.to_lowercase().contains(&query)
+                            || (entry.image.is_some()
+                                && ("图片".contains(&query) || "image".contains(&query)))
+                    }) {
+                        groups
+                            .entry(entry.timestamp.date_naive())
+                            .or_default()
+                            .push(entry);
+                    }
+                    let mut dates = Vec::with_capacity(groups.len());
+                    let mut rows = Vec::new();
+                    for (date, mut entries) in groups.into_iter().rev() {
+                        let index = rows.len();
+                        dates.push((date, index));
+                        rows.push(
+                            Self::history_date(date, index, cx.weak_entity()).into_any_element(),
+                        );
+                        entries.sort_by_key(|entry| !entry.pinned);
+                        rows.extend(
+                            entries.into_iter().map(|entry| {
+                                self.history_item(entry, &query, cx).into_any_element()
+                            }),
+                        );
+                    }
+                    let empty = rows.is_empty();
+                    let date_menu = self
+                        .date_menu
+                        .map(|anchor| Self::history_date_menu(anchor, &dates, cx));
+                    view.child(self.toolbar(cx))
                         .child(
                             div()
-                                .id("clipboard-history")
+                                .relative()
                                 .min_h_0()
                                 .flex_1()
+                                .overflow_hidden()
                                 .flex()
                                 .flex_col()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.history_scroll)
-                                .gap_2()
-                                .px_3()
-                                .pb_3()
-                                .when(empty, |list| {
-                                    list.child(
-                                        div().p_4().text_center().text_color(rgb(0xaab2c3)).child(
-                                            if query.is_empty() {
-                                                "暂无剪贴板记录"
-                                            } else {
-                                                "没有匹配的记录"
-                                            },
-                                        ),
-                                    )
+                                .child(
+                                    div()
+                                        .id("clipboard-history")
+                                        .min_h_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.history_scroll)
+                                        .gap_2()
+                                        .px_3()
+                                        .pb_3()
+                                        .when(empty, |list| {
+                                            list.child(
+                                                div()
+                                                    .p_4()
+                                                    .text_center()
+                                                    .text_color(rgb(0xaab2c3))
+                                                    .child(if query.is_empty() {
+                                                        "暂无剪贴板记录"
+                                                    } else {
+                                                        "没有匹配的记录"
+                                                    }),
+                                            )
+                                        })
+                                        .children(rows),
+                                )
+                                .when(!empty, |list| {
+                                    list.child(self.sticky_history_date(dates, cx))
                                 })
-                                .children(entries.map(|entry| self.history_item(entry, cx))),
+                                .child(self.history_scrollbar()),
                         )
-                        .child(self.history_scrollbar()),
-                )
-            })
+                        .children(date_menu)
+                },
+            )
             .when_some(self.status.as_ref(), |view, (message, is_error)| {
                 view.child(
                     div()

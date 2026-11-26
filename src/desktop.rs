@@ -30,6 +30,7 @@ const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_VALUE: &str = "SoloClipboard";
 const FILE_NOT_FOUND_HRESULT: i32 = 0x80070002_u32 as i32;
 const VK_MENU_MASK: u16 = 0xe8;
+const MODIFIER_KEYS: [u16; 5] = [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN];
 pub const STARTUP_ARG: &str = "--startup";
 
 pub fn starts_with_windows() -> Result<bool, String> {
@@ -104,10 +105,10 @@ impl Shortcut {
         };
         // GPUI can fold Shift into the character for number-row keys.
         let shift = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
-        let modifiers = u32::from(stroke.modifiers.control) * MOD_CONTROL
-            | u32::from(stroke.modifiers.alt) * MOD_ALT
-            | u32::from(shift) * MOD_SHIFT
-            | u32::from(stroke.modifiers.platform) * MOD_WIN;
+        let modifiers = (u32::from(stroke.modifiers.control) * MOD_CONTROL)
+            | (u32::from(stroke.modifiers.alt) * MOD_ALT)
+            | (u32::from(shift) * MOD_SHIFT)
+            | (u32::from(stroke.modifiers.platform) * MOD_WIN);
         (modifiers != 0).then_some(Self { modifiers, key })
     }
 
@@ -251,9 +252,7 @@ fn intercept_escape(message: u32) -> bool {
             unsafe {
                 if IsWindowVisible(hwnd) == 0
                     || belongs_to_app(GetForegroundWindow())
-                    || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
-                        .into_iter()
-                        .any(key_is_down)
+                    || MODIFIER_KEYS.into_iter().any(key_is_down)
                 {
                     return false;
                 }
@@ -431,13 +430,8 @@ impl TrayWindow {
         if target.is_null() || unsafe { IsWindow(target) } == 0 {
             return Err("请先在目标应用中定位输入位置，再打开剪贴板".into());
         }
-        unsafe {
-            if [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
-                .iter()
-                .any(|key| GetAsyncKeyState(i32::from(*key)) < 0)
-            {
-                return Err("请松开修饰键后再粘贴".into());
-            }
+        if MODIFIER_KEYS.into_iter().any(key_is_down) {
+            return Err("请松开修饰键后再粘贴".into());
         }
         copy()?;
         unsafe {

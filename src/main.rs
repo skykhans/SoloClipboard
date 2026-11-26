@@ -26,8 +26,6 @@ fn main() {
     let platform = WindowsPlatform::new(false).expect("无法初始化 Windows 平台");
     Application::with_platform(Rc::new(platform)).run(move |cx| {
         cx.set_prompt_builder(ui::render_prompt);
-        cx.on_action(|_action: &Quit, cx| cx.quit());
-
         let bounds = Bounds::centered(None, size(px(600.0), px(500.0)), cx);
         let previous_window = if startup {
             std::ptr::null_mut()
@@ -64,5 +62,3 @@ fn main() {
         drop(launch);
     });
 }
-
-actions!([Quit]);

@@ -28,9 +28,6 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 embed-resource = "3.0"
 
-[patch.crates-io]
-# 如果遇到网络问题，可以尝试使用镜像源
-
 [profile.dev]
 opt-level = 1
 

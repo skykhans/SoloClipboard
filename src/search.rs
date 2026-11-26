@@ -5,12 +5,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 const LABEL: &str = "搜索剪贴板历史";
+const LINE_HEIGHT: Pixels = px(22.);
 
 pub struct SearchInput {
     pub text: String,
     focus: FocusHandle,
     anchor: usize,
     cursor: usize,
+    selecting: bool,
     marked: Option<Range<usize>>,
     layout: Option<(Bounds<Pixels>, ShapedLine)>,
 }
@@ -22,6 +24,7 @@ impl SearchInput {
             focus: cx.focus_handle(),
             anchor: 0,
             cursor: 0,
+            selecting: false,
             marked: None,
             layout: None,
         }
@@ -29,6 +32,13 @@ impl SearchInput {
 
     fn selection(&self) -> Range<usize> {
         self.anchor.min(self.cursor)..self.anchor.max(self.cursor)
+    }
+
+    fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        self.layout.as_ref().map(|(bounds, line)| {
+            line.closest_index_for_x(x - bounds.left())
+                .min(self.text.len())
+        })
     }
 
     fn utf16_offset(&self, byte: usize) -> usize {
@@ -246,18 +256,13 @@ impl EntityInputHandler for SearchInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let (bounds, line) = self.layout.as_ref()?;
-        Some(
-            self.utf16_offset(
-                line.closest_index_for_x(point.x - bounds.left())
-                    .min(self.text.len()),
-            ),
-        )
+        Some(self.utf16_offset(self.index_for_x(point.x)?))
     }
 }
 
 impl Render for SearchInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input = cx.entity();
         div()
             .id("search")
             .role(Role::TextInput)
@@ -273,7 +278,7 @@ impl Render for SearchInput {
             .bg(rgb(0x17191f))
             .text_color(rgb(0xf1f3f7))
             .text_sm()
-            .line_height(px(22.))
+            .line_height(LINE_HEIGHT)
             .flex()
             .items_center()
             .gap_2()
@@ -288,18 +293,22 @@ impl Render for SearchInput {
                         unsafe { SetForegroundWindow(hwnd) };
                     }
                     input.focus.focus(window, cx);
-                    let cursor =
-                        input
-                            .layout
-                            .as_ref()
-                            .map_or(input.text.len(), |(bounds, line)| {
-                                line.closest_index_for_x(event.position.x - bounds.left())
-                                    .min(input.text.len())
-                            });
+                    input.selecting = true;
+                    let cursor = input
+                        .index_for_x(event.position.x)
+                        .unwrap_or(input.text.len());
                     input.move_cursor(cursor, event.modifiers.shift, window, cx);
                 }),
             )
-            .child(div().min_w_0().flex_1().child(SearchText(cx.entity())))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, cx| Self::paint_text(&input, bounds, window, cx),
+                )
+                .min_w_0()
+                .flex_1()
+                .h(LINE_HEIGHT),
+            )
             .when(!self.text.is_empty(), |input| {
                 input.child(
                     div()
@@ -325,55 +334,14 @@ impl Render for SearchInput {
     }
 }
 
-struct SearchText(Entity<SearchInput>);
-
-impl Element for SearchText {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut Window,
-        _: &mut App,
-    ) {
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
+impl SearchInput {
+    fn paint_text(
+        entity: &Entity<Self>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
-        let input = self.0.read(cx);
+        let input = entity.read(cx);
         let style = window.text_style();
         let empty = input.text.is_empty();
         let text: SharedString = if empty {
@@ -419,18 +387,17 @@ impl Element for SearchText {
             None,
         );
         let focus = input.focus.clone();
+        let focused = focus.is_focused(window);
         let selection = input.selection();
         let cursor = line.x_for_index(input.cursor);
-        let offset = (cursor + px(2.) - bounds.size.width).max(px(0.));
         let mut line_bounds = bounds;
-        line_bounds.origin.x -= offset;
-        if empty {
-            line_bounds.origin.x = bounds.left();
+        if !empty {
+            line_bounds.origin.x -= (cursor + px(2.) - bounds.size.width).max(px(0.));
         }
-        window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
+        window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
         let height = window.line_height();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            if focus.is_focused(window) && !selection.is_empty() {
+            if focused && !selection.is_empty() {
                 let start = line.x_for_index(selection.start);
                 let end = line.x_for_index(selection.end);
                 let position = point(line_bounds.left() + start.min(end), bounds.top());
@@ -447,7 +414,7 @@ impl Element for SearchText {
                 window,
                 cx,
             );
-            if focus.is_focused(window) && selection.is_empty() {
+            if focused && selection.is_empty() {
                 let position = point(line_bounds.left() + cursor, bounds.top() + px(2.));
                 window.paint_quad(fill(
                     Bounds::new(position, size(px(1.), height - px(4.))),
@@ -455,7 +422,31 @@ impl Element for SearchText {
                 ));
             }
         });
-        self.0
-            .update(cx, |input, _| input.layout = Some((line_bounds, line)));
+        entity.update(cx, |input, _| input.layout = Some((line_bounds, line)));
+
+        let drag_selection =
+            window.listener_for(entity, |input, event: &MouseMoveEvent, window, cx| {
+                if !input.selecting || !event.dragging() {
+                    return;
+                }
+                if let Some(cursor) = input
+                    .index_for_x(event.position.x)
+                    .filter(|&cursor| cursor != input.cursor)
+                {
+                    input.move_cursor(cursor, true, window, cx);
+                }
+            });
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase.capture() {
+                drag_selection(event, window, cx);
+            }
+        });
+
+        let end_selection = window.handler_for(entity, |input, _, _| input.selecting = false);
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase.capture() && event.button == MouseButton::Left {
+                end_selection(window, cx);
+            }
+        });
     }
 }

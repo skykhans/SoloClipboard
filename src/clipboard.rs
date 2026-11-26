@@ -1,12 +1,13 @@
+use crate::desktop::window_hwnd;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clipboard_win::{formats::CF_DIB, raw, Clipboard};
 use gpui::{App, ClipboardEntry as SystemEntry, Image, ImageFormat, Window};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use windows_sys::Win32::Foundation::HWND;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClipboardEntry {
@@ -68,7 +69,7 @@ impl ClipboardMonitor {
         };
         self.sequence = sequence;
         let content = item.text().unwrap_or_default();
-        let image = item.entries().iter().find_map(|entry| match entry {
+        let image = item.into_entries().find_map(|entry| match entry {
             SystemEntry::Image(image) => Some(image),
             _ => None,
         });
@@ -82,7 +83,7 @@ impl ClipboardMonitor {
                     .as_ref()
                     .and_then(ClipboardImage::load)
                     .as_deref()
-                    == image
+                    == image.as_ref()
         }) {
             return false;
         }
@@ -94,7 +95,7 @@ impl ClipboardMonitor {
             image: image.map(|image| ClipboardImage {
                 mime: image.format.mime_type().to_owned(),
                 data: STANDARD.encode(&image.bytes),
-                image: OnceCell::from(Some(Arc::new(image.clone()))),
+                image: OnceCell::from(Some(Arc::new(image))),
             }),
         });
         self.next_id += 1;
@@ -107,16 +108,13 @@ impl ClipboardMonitor {
             .iter()
             .find(|entry| entry.id == id)
             .ok_or("记录已删除")?;
-        let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return Err("无法获取 Windows 窗口句柄".into());
-        };
+        let hwnd =
+            window_hwnd(window).map_err(|error| format!("无法获取 Windows 窗口句柄：{error}"))?;
         if let Some(image) = &entry.image {
             let image = image.load().ok_or("图片数据无法读取")?;
-            write_image(&image, handle)?;
+            write_image(&image, hwnd)?;
         } else {
-            let _clipboard =
-                Clipboard::new_for(handle.hwnd.get() as _).map_err(|error| error.to_string())?;
+            let _clipboard = Clipboard::new_for(hwnd).map_err(|error| error.to_string())?;
             raw::empty().map_err(|error| error.to_string())?;
             raw::set_string_with(&entry.content, clipboard_win::options::NoClear)
                 .map_err(|error| error.to_string())?;
@@ -147,7 +145,7 @@ impl ClipboardMonitor {
     }
 }
 
-fn write_image(image: &Image, handle: raw_window_handle::Win32WindowHandle) -> Result<(), String> {
+fn write_image(image: &Image, hwnd: HWND) -> Result<(), String> {
     let clipboard_format = |name| {
         raw::register_format(name)
             .map(NonZeroU32::get)
@@ -183,8 +181,7 @@ fn write_image(image: &Image, handle: raw_window_handle::Win32WindowHandle) -> R
         Some(clipboard_format("PNG")?)
     };
 
-    let _clipboard =
-        Clipboard::new_for(handle.hwnd.get() as _).map_err(|error| error.to_string())?;
+    let _clipboard = Clipboard::new_for(hwnd).map_err(|error| error.to_string())?;
     raw::empty().map_err(|error| error.to_string())?;
     if let Some(format) = native_format {
         raw::set_without_clear(format, image.bytes()).map_err(|error| error.to_string())?;

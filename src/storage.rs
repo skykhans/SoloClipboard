@@ -6,7 +6,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub struct Storage {
-    file_path: PathBuf,
+    directory: PathBuf,
     _lock: File,
 }
 
@@ -25,15 +25,14 @@ impl Storage {
             fs::TryLockError::WouldBlock => "历史记录正由另一个窗口使用".to_string(),
             fs::TryLockError::Error(error) => error.to_string(),
         })?;
-        let file_path = directory.join("history.json");
-        let history = match Self::read(&file_path) {
+        let history = match Self::read(&directory.join("history.json")) {
             Ok(history) => history,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.to_string()),
         };
         Ok((
             Self {
-                file_path,
+                directory,
                 _lock: lock,
             },
             history,
@@ -49,18 +48,18 @@ impl Storage {
     }
 
     pub fn save_history(&self, history: &[ClipboardEntry]) -> Result<(), String> {
-        Self::replace_json(&self.file_path, history)
+        Self::replace_json(&self.directory.join("history.json"), history)
     }
 
     pub fn load_settings(&self) -> io::Result<Settings> {
-        match Self::read_json(&self.file_path.with_file_name("settings.json")) {
+        match Self::read_json(&self.directory.join("settings.json")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Settings::default()),
             result => result,
         }
     }
 
     pub fn save_settings(&self, settings: Settings) -> Result<(), String> {
-        Self::replace_json(&self.file_path.with_file_name("settings.json"), &settings)
+        Self::replace_json(&self.directory.join("settings.json"), &settings)
     }
 
     fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
