@@ -184,6 +184,8 @@ impl TrayWindow {
             if !tray.0.add_icon() {
                 return Err("无法添加通知区域图标".into());
             }
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as LPARAM);
             let large = LoadIconW(instance, ICON_RESOURCE);
             SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as LPARAM);
@@ -192,6 +194,8 @@ impl TrayWindow {
     }
 
     pub fn paste(&self, copy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        self.0
+            .remember_paste_target(unsafe { GetForegroundWindow() });
         let target = self.0.paste_target.get();
         if target.is_null() || unsafe { IsWindow(target) } == 0 {
             return Err("请先在目标应用中定位输入位置，再打开剪贴板".into());
@@ -206,17 +210,18 @@ impl TrayWindow {
         }
         copy()?;
         unsafe {
-            if SetForegroundWindow(target) == 0
-                || SendMessageTimeoutW(
-                    target,
-                    WM_NULL,
-                    0,
-                    0,
-                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                    250,
-                    ptr::null_mut(),
-                ) == 0
-                || GetForegroundWindow() != target
+            if GetForegroundWindow() != target
+                && (SetForegroundWindow(target) == 0
+                    || SendMessageTimeoutW(
+                        target,
+                        WM_NULL,
+                        0,
+                        0,
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                        250,
+                        ptr::null_mut(),
+                    ) == 0
+                    || GetForegroundWindow() != target)
             {
                 return Err("无法切换回原来的输入窗口".into());
             }
@@ -242,7 +247,6 @@ impl TrayWindow {
                 mem::size_of::<INPUT>() as i32,
             ) != keys.len() as u32
             {
-                SetForegroundWindow(self.0.hwnd.get());
                 return Err("无法向原来的输入窗口发送粘贴操作".into());
             }
             ShowWindow(self.0.hwnd.get(), SW_HIDE);
@@ -357,12 +361,20 @@ impl WindowState {
         unsafe {
             self.remember_paste_target(GetForegroundWindow());
             let command = if IsIconic(hwnd) != 0 {
-                SW_RESTORE
+                SW_SHOWNOACTIVATE
             } else {
-                SW_SHOW
+                SW_SHOWNA
             };
             ShowWindow(hwnd, command);
-            SetForegroundWindow(hwnd);
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -379,6 +391,7 @@ impl WindowState {
             }
             AppendMenuW(menu, MF_STRING, OPEN_MENU, windows_sys::w!("打开剪贴板"));
             AppendMenuW(menu, MF_STRING, EXIT_MENU, windows_sys::w!("退出"));
+            let previous = GetForegroundWindow();
             SetForegroundWindow(hwnd);
             let command = TrackPopupMenu(
                 menu,
@@ -390,6 +403,9 @@ impl WindowState {
                 ptr::null(),
             );
             DestroyMenu(menu);
+            if !previous.is_null() && previous != hwnd && GetForegroundWindow() == hwnd {
+                SetForegroundWindow(previous);
+            }
             if self.hwnd.get().is_null() {
                 return;
             }
@@ -421,6 +437,7 @@ unsafe extern "system" fn window_proc(
         Rc::from_raw(state_ptr)
     };
     match message {
+        WM_MOUSEACTIVATE if lparam as u16 == HTCLIENT as u16 => return MA_NOACTIVATE as LRESULT,
         WM_ACTIVATE if wparam as u16 != WA_INACTIVE as u16 => {
             state.remember_paste_target(lparam as HWND);
         }

@@ -39,18 +39,14 @@ fn main() {
                     window_min_size: Some(size(px(400.0), px(300.0))),
                     kind: WindowKind::Normal,
                     show: !startup,
-                    focus: !startup,
+                    focus: false,
                     ..Default::default()
                 },
                 |window, cx| cx.new(|cx| ui::ClipboardView::new(window, previous_window, cx)),
             )
             .unwrap();
-        if startup {
-            if !window.read(cx).unwrap().has_tray() {
-                cx.quit();
-            }
-        } else {
-            cx.activate(true);
+        if startup && !window.read(cx).unwrap().has_tray() {
+            cx.quit();
         }
     });
 }

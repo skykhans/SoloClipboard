@@ -344,6 +344,9 @@ impl ClipboardView {
     }
 
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() {
+            window.activate_window();
+        }
         let response = window.prompt(
             PromptLevel::Warning,
             "清空剪贴板历史？",
@@ -587,6 +590,9 @@ impl ClipboardView {
                                     .tab_index(0)
                                     .focus(|style| style.bg(rgb(0x31564b)))
                                     .on_click(cx.listener(|view, _, window, cx| {
+                                        if !window.is_window_active() {
+                                            window.activate_window();
+                                        }
                                         view.shortcut_focus.focus(window, cx);
                                         cx.notify();
                                     }))

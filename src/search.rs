@@ -281,6 +281,9 @@ impl Render for SearchInput {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|input, event: &MouseDownEvent, window, cx| {
+                    if !window.is_window_active() {
+                        window.activate_window();
+                    }
                     input.focus.focus(window, cx);
                     let cursor =
                         input
