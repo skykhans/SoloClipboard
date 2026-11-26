@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod desktop;
+mod instance;
 mod search;
 mod storage;
 mod ui;
@@ -15,6 +16,13 @@ fn main() {
     let startup = std::env::args_os()
         .skip(1)
         .any(|arg| arg == desktop::STARTUP_ARG);
+    let launch = instance::LaunchLock::acquire().expect("无法获取启动锁");
+    if launch
+        .reuse_window(!startup)
+        .expect("无法打开已有的剪贴板窗口")
+    {
+        return;
+    }
     let platform = WindowsPlatform::new(false).expect("无法初始化 Windows 平台");
     Application::with_platform(Rc::new(platform)).run(move |cx| {
         cx.set_prompt_builder(ui::render_prompt);
@@ -47,7 +55,13 @@ fn main() {
             .unwrap();
         if startup && !window.read(cx).unwrap().has_tray() {
             cx.quit();
+        } else {
+            window
+                .update(cx, |_, window, _| instance::register_window(window))
+                .expect("无法访问剪贴板窗口")
+                .expect("无法注册剪贴板窗口");
         }
+        drop(launch);
     });
 }
 

@@ -1,6 +1,8 @@
+use crate::desktop::window_hwnd;
 use gpui::{prelude::*, *};
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
+use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 const LABEL: &str = "搜索剪贴板历史";
 
@@ -281,8 +283,9 @@ impl Render for SearchInput {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|input, event: &MouseDownEvent, window, cx| {
-                    if !window.is_window_active() {
-                        window.activate_window();
+                    if let Ok(hwnd) = window_hwnd(window) {
+                        // Activate during the click while Windows permits the foreground change.
+                        unsafe { SetForegroundWindow(hwnd) };
                     }
                     input.focus.focus(window, cx);
                     let cursor =

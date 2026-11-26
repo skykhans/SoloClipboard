@@ -9,8 +9,8 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyState, RegisterHotKey, SendInput, UnregisterHotKey, VkKeyScanW,
             INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL,
-            MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
-            VK_V,
+            MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
+            VK_SHIFT, VK_V,
         },
         Shell::{
             DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON,
@@ -22,6 +22,7 @@ use windows_sys::Win32::{
 
 const TRAY_MESSAGE: u32 = WM_APP + 100;
 const HIDE_MINIMIZED: u32 = WM_APP + 101;
+const DISMISS_WINDOW: u32 = WM_APP + 103;
 const ICON_RESOURCE: *const u16 = 101 as *const u16;
 const OPEN_MENU: usize = 1;
 const EXIT_MENU: usize = 2;
@@ -150,48 +151,30 @@ impl Default for Settings {
 struct RegisteredShortcut {
     id: i32,
     shortcut: Shortcut,
-    hook: Option<HHOOK>,
 }
 
 impl RegisteredShortcut {
     fn register(hwnd: HWND, id: i32, shortcut: Shortcut) -> io::Result<Self> {
-        let hook = if shortcut == Shortcut::WIN_V {
-            let hook = unsafe {
-                SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(win_v_proc),
-                    GetModuleHandleW(ptr::null()),
-                    0,
-                )
-            };
-            if hook.is_null() {
-                return Err(io::Error::last_os_error());
-            }
+        if shortcut == Shortcut::WIN_V {
             WIN_V_TARGET.set(Some(WinVTarget {
                 hwnd,
                 id,
                 v_down: false,
             }));
-            Some(hook)
-        } else {
-            if unsafe { RegisterHotKey(hwnd, id, shortcut.modifiers | MOD_NOREPEAT, shortcut.key) }
-                == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            None
-        };
-        Ok(Self { id, shortcut, hook })
+        } else if unsafe {
+            RegisterHotKey(hwnd, id, shortcut.modifiers | MOD_NOREPEAT, shortcut.key)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { id, shortcut })
     }
 
     fn unregister(self, hwnd: HWND) {
-        unsafe {
-            if let Some(hook) = self.hook {
-                WIN_V_TARGET.set(None);
-                UnhookWindowsHookEx(hook);
-            } else {
-                UnregisterHotKey(hwnd, self.id);
-            }
+        if self.shortcut == Shortcut::WIN_V {
+            WIN_V_TARGET.set(None);
+        } else {
+            unsafe { UnregisterHotKey(hwnd, self.id) };
         }
     }
 }
@@ -205,52 +188,155 @@ struct WinVTarget {
 
 thread_local! {
     static WIN_V_TARGET: Cell<Option<WinVTarget>> = const { Cell::new(None) };
+    static INPUT_WINDOW: Cell<HWND> = const { Cell::new(ptr::null_mut()) };
+    static ESCAPE_DOWN: Cell<bool> = const { Cell::new(false) };
 }
 
-unsafe extern "system" fn win_v_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32
-        && unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode } == u32::from(VK_V)
-        && WIN_V_TARGET.with(|target| {
-            let Some(mut state) = target.get() else {
-                return false;
-            };
-            match wparam as u32 {
-                WM_KEYUP | WM_SYSKEYUP if state.v_down => {
-                    state.v_down = false;
-                    target.set(Some(state));
-                    true
-                }
-                WM_KEYDOWN | WM_SYSKEYDOWN if state.v_down => true,
-                WM_KEYDOWN | WM_SYSKEYDOWN if win_v_modifiers_down() => {
-                    state.v_down = true;
-                    target.set(Some(state));
-                    // Prevent the Win release from opening Start after swallowing V.
-                    let mask = [
-                        keyboard_input(VK_MENU_MASK, 0),
-                        keyboard_input(VK_MENU_MASK, KEYEVENTF_KEYUP),
-                    ];
-                    unsafe {
-                        SendInput(
-                            mask.len() as u32,
-                            mask.as_ptr(),
-                            mem::size_of::<INPUT>() as i32,
-                        );
-                        PostMessageW(state.hwnd, WM_HOTKEY, state.id as usize, 0);
-                    }
-                    true
-                }
-                _ => false,
-            }
-        })
-    {
-        return 1;
+unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let key = unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode } as u16;
+        let message = wparam as u32;
+        if match key {
+            VK_V => intercept_win_v(message),
+            VK_ESCAPE => intercept_escape(message),
+            _ => false,
+        } {
+            return 1;
+        }
     }
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
 }
 
+fn intercept_win_v(message: u32) -> bool {
+    WIN_V_TARGET.with(|target| {
+        let Some(mut state) = target.get() else {
+            return false;
+        };
+        match message {
+            WM_KEYUP | WM_SYSKEYUP if state.v_down => {
+                state.v_down = false;
+                target.set(Some(state));
+                true
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN if state.v_down => true,
+            WM_KEYDOWN | WM_SYSKEYDOWN if win_v_modifiers_down() => {
+                state.v_down = true;
+                target.set(Some(state));
+                // Prevent the Win release from opening Start after swallowing V.
+                let mask = [
+                    keyboard_input(VK_MENU_MASK, 0),
+                    keyboard_input(VK_MENU_MASK, KEYEVENTF_KEYUP),
+                ];
+                unsafe {
+                    SendInput(
+                        mask.len() as u32,
+                        mask.as_ptr(),
+                        mem::size_of::<INPUT>() as i32,
+                    );
+                    PostMessageW(state.hwnd, WM_HOTKEY, state.id as usize, 0);
+                }
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
+fn intercept_escape(message: u32) -> bool {
+    match message {
+        WM_KEYUP | WM_SYSKEYUP => ESCAPE_DOWN.replace(false),
+        WM_KEYDOWN if ESCAPE_DOWN.get() => true,
+        WM_KEYDOWN => {
+            let hwnd = INPUT_WINDOW.get();
+            unsafe {
+                if IsWindowVisible(hwnd) == 0
+                    || belongs_to_app(GetForegroundWindow())
+                    || [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                        .into_iter()
+                        .any(key_is_down)
+                {
+                    return false;
+                }
+                let posted = PostMessageW(hwnd, DISMISS_WINDOW, 0, 0) != 0;
+                ESCAPE_DOWN.set(posted);
+                posted
+            }
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32
+        && matches!(
+            wparam as u32,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+    {
+        let hwnd = INPUT_WINDOW.get();
+        unsafe {
+            let point = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
+            let foreground = GetForegroundWindow();
+            if IsWindowVisible(hwnd) != 0
+                && (foreground == hwnd || !belongs_to_app(foreground))
+                && !belongs_to_app(WindowFromPoint(point))
+            {
+                PostMessageW(hwnd, DISMISS_WINDOW, 0, 0);
+            }
+        }
+    }
+    unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
+}
+
+fn belongs_to_app(hwnd: HWND) -> bool {
+    let mut process = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut process) };
+    process == std::process::id()
+}
+
+struct InputHooks {
+    keyboard: HHOOK,
+    mouse: HHOOK,
+}
+
+impl InputHooks {
+    fn install(hwnd: HWND) -> io::Result<Self> {
+        unsafe {
+            let module = GetModuleHandleW(ptr::null());
+            let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
+            if keyboard.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+            if mouse.is_null() {
+                let error = io::Error::last_os_error();
+                UnhookWindowsHookEx(keyboard);
+                return Err(error);
+            }
+            INPUT_WINDOW.set(hwnd);
+            Ok(Self { keyboard, mouse })
+        }
+    }
+}
+
+impl Drop for InputHooks {
+    fn drop(&mut self) {
+        INPUT_WINDOW.set(ptr::null_mut());
+        ESCAPE_DOWN.set(false);
+        unsafe {
+            UnhookWindowsHookEx(self.mouse);
+            UnhookWindowsHookEx(self.keyboard);
+        }
+    }
+}
+
+fn key_is_down(key: u16) -> bool {
+    unsafe { GetAsyncKeyState(i32::from(key)) < 0 }
+}
+
 fn win_v_modifiers_down() -> bool {
-    let down = |key| unsafe { GetAsyncKeyState(i32::from(key)) < 0 };
-    (down(VK_LWIN) || down(VK_RWIN)) && !down(VK_CONTROL) && !down(VK_MENU) && !down(VK_SHIFT)
+    (key_is_down(VK_LWIN) || key_is_down(VK_RWIN))
+        && ![VK_CONTROL, VK_MENU, VK_SHIFT].into_iter().any(key_is_down)
 }
 
 fn keyboard_input(key: u16, flags: u32) -> INPUT {
@@ -266,6 +352,14 @@ fn keyboard_input(key: u16, flags: u32) -> INPUT {
     }
 }
 
+pub fn window_hwnd(window: &Window) -> Result<HWND, raw_window_handle::HandleError> {
+    let handle = HasWindowHandle::window_handle(window)?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err(raw_window_handle::HandleError::NotSupported);
+    };
+    Ok(handle.hwnd.get() as HWND)
+}
+
 pub struct TrayWindow(Rc<WindowState>);
 
 struct WindowState {
@@ -276,6 +370,7 @@ struct WindowState {
     close_to_tray: Cell<bool>,
     exiting: Cell<bool>,
     hotkey: Cell<Option<RegisteredShortcut>>,
+    input_hooks: Cell<Option<InputHooks>>,
     paste_target: Cell<HWND>,
 }
 
@@ -285,11 +380,7 @@ impl TrayWindow {
         close_to_tray: bool,
         previous_window: HWND,
     ) -> Result<Self, String> {
-        let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return Err("无法获取 Windows 窗口句柄".into());
-        };
-        let hwnd = handle.hwnd.get() as HWND;
+        let hwnd = window_hwnd(window).map_err(|error| error.to_string())?;
         unsafe {
             let instance = GetModuleHandleW(ptr::null());
             let icon = LoadImageW(
@@ -311,6 +402,7 @@ impl TrayWindow {
                 close_to_tray: Cell::new(close_to_tray),
                 exiting: Cell::new(false),
                 hotkey: Cell::new(None),
+                input_hooks: Cell::new(None),
                 paste_target: Cell::new(ptr::null_mut()),
             });
             state.remember_paste_target(previous_window);
@@ -321,6 +413,9 @@ impl TrayWindow {
             if !tray.0.add_icon() {
                 return Err("无法添加通知区域图标".into());
             }
+            tray.0.input_hooks.set(Some(
+                InputHooks::install(hwnd).map_err(|error| error.to_string())?,
+            ));
             tray.set_settings_open(false);
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as LPARAM);
             let large = LoadIconW(instance, ICON_RESOURCE);
@@ -383,6 +478,10 @@ impl TrayWindow {
 
     pub fn set_close_to_tray(&self, enabled: bool) {
         self.0.close_to_tray.set(enabled);
+    }
+
+    pub fn hide(&self) {
+        self.0.hide();
     }
 
     pub fn set_settings_open(&self, open: bool) {
@@ -493,6 +592,7 @@ impl WindowState {
             if let Some(registered) = self.hotkey.take() {
                 registered.unregister(hwnd);
             }
+            drop(self.input_hooks.take());
             RemoveWindowSubclass(hwnd, Some(window_proc), 1);
         }
         self.hwnd.set(ptr::null_mut());
@@ -604,6 +704,10 @@ unsafe extern "system" fn window_proc(
         }
         WM_ACTIVATE if wparam as u16 != WA_INACTIVE as u16 => {
             state.remember_paste_target(lparam as HWND);
+        }
+        DISMISS_WINDOW => {
+            state.hide();
+            return 0;
         }
         WM_SYSCOMMAND if wparam & 0xfff0 == SC_MINIMIZE as usize && state.has_icon.get() => {
             state.hide();

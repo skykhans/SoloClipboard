@@ -3,8 +3,10 @@ use crate::desktop::{self, Settings, Shortcut, TrayWindow};
 use crate::search::SearchInput;
 use crate::storage::Storage;
 use gpui::{prelude::*, *};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::HWND;
 
@@ -129,6 +131,8 @@ pub struct ClipboardView {
     monitor: ClipboardMonitor,
     storage: Option<Storage>,
     search: Entity<SearchInput>,
+    history_scroll: ScrollHandle,
+    scrollbar_drag: Rc<Cell<Option<Pixels>>>,
     selection: Option<HashSet<usize>>,
     status: Option<(String, bool)>,
     export_status_timeout: Option<Task<()>>,
@@ -139,6 +143,7 @@ pub struct ClipboardView {
     shortcut_focus: FocusHandle,
     dirty: bool,
     _search_subscription: Subscription,
+    _escape_subscription: Subscription,
 }
 
 impl ClipboardView {
@@ -172,6 +177,16 @@ impl ClipboardView {
         });
         let search = cx.new(SearchInput::new);
         let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
+        let escape_subscription = cx.observe_keystrokes(|view, event, window, _| {
+            if event.keystroke.key == "escape"
+                && event.keystroke.modifiers == Modifiers::default()
+                && !window.has_active_prompt()
+            {
+                if let Some(tray) = &view.tray {
+                    tray.hide();
+                }
+            }
+        });
         cx.spawn(async |view, cx| loop {
             if view
                 .update(cx, |view, cx| {
@@ -196,6 +211,8 @@ impl ClipboardView {
             monitor: ClipboardMonitor::new(history),
             storage,
             search,
+            history_scroll: ScrollHandle::new(),
+            scrollbar_drag: Rc::default(),
             selection: None,
             status,
             export_status_timeout: None,
@@ -206,7 +223,110 @@ impl ClipboardView {
             shortcut_focus: cx.focus_handle(),
             dirty: false,
             _search_subscription: search_subscription,
+            _escape_subscription: escape_subscription,
         }
+    }
+
+    fn history_scrollbar(&self) -> impl IntoElement {
+        let scroll = self.history_scroll.clone();
+        let drag = self.scrollbar_drag.clone();
+        canvas(
+            {
+                let scroll = scroll.clone();
+                move |bounds, window, _| {
+                    (scroll.max_offset().y > px(0.)).then(|| {
+                        window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll)
+                    })
+                }
+            },
+            move |bounds, hitbox, window, _| {
+                let Some(hitbox) = hitbox else {
+                    drag.set(None);
+                    return;
+                };
+                let max_offset = scroll.max_offset().y;
+                let track = Bounds {
+                    origin: point(bounds.left() + px(3.), bounds.top()),
+                    size: size(px(6.), bounds.size.height),
+                };
+                let viewport_height = scroll.bounds().size.height;
+                let thumb_height = (track.size.height
+                    * (viewport_height / (viewport_height + max_offset)))
+                    .max(px(24.))
+                    .min(track.size.height);
+                let travel = track.size.height - thumb_height;
+                let thumb = Bounds {
+                    origin: point(
+                        track.left(),
+                        track.top() + travel * (-scroll.offset().y / max_offset),
+                    ),
+                    size: size(track.size.width, thumb_height),
+                };
+                window.paint_quad(fill(track, rgb(0x30343e)).corner_radii(px(3.)));
+                window.paint_quad(fill(thumb, rgb(0x89919f)).corner_radii(px(3.)));
+
+                window.on_mouse_event({
+                    let drag = drag.clone();
+                    let scroll = scroll.clone();
+                    move |event: &MouseDownEvent, phase, window, cx| {
+                        if !phase.capture() || event.button != MouseButton::Left {
+                            return;
+                        }
+                        drag.set(None);
+                        if !hitbox.is_hovered(window) {
+                            return;
+                        }
+                        let y = event.position.y;
+                        if y < thumb.top() || y > thumb.bottom() {
+                            let page = if y < thumb.top() {
+                                viewport_height
+                            } else {
+                                -viewport_height
+                            };
+                            let mut offset = scroll.offset();
+                            offset.y = (offset.y + page).clamp(-max_offset, px(0.));
+                            scroll.set_offset(offset);
+                            window.refresh();
+                        } else {
+                            drag.set(Some(y - thumb.top()));
+                        }
+                        cx.stop_propagation();
+                    }
+                });
+                window.on_mouse_event({
+                    let drag = drag.clone();
+                    move |event: &MouseMoveEvent, phase, window, cx| {
+                        if !phase.capture() {
+                            return;
+                        }
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            drag.set(None);
+                            return;
+                        }
+                        let Some(grab_offset) = drag.get().filter(|_| travel > px(0.)) else {
+                            return;
+                        };
+                        let position = event.position.y - track.top() - grab_offset;
+                        let mut offset = scroll.offset();
+                        offset.y = -max_offset * (position / travel).clamp(0., 1.);
+                        scroll.set_offset(offset);
+                        window.refresh();
+                        cx.stop_propagation();
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase.capture() && event.button == MouseButton::Left && drag.take().is_some()
+                    {
+                        cx.stop_propagation();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .right_0()
+        .top_1()
+        .bottom_3()
+        .w(px(12.))
     }
 
     pub fn has_tray(&self) -> bool {
@@ -848,25 +968,37 @@ impl Render for ClipboardView {
             .when(!self.settings_open, |view| {
                 view.child(self.toolbar(cx)).child(
                     div()
-                        .id("clipboard-history")
+                        .relative()
                         .min_h_0()
                         .flex_1()
                         .flex()
                         .flex_col()
-                        .overflow_y_scroll()
-                        .gap_2()
-                        .px_3()
-                        .pb_3()
-                        .when(empty, |list| {
-                            list.child(div().p_4().text_center().text_color(rgb(0xaab2c3)).child(
-                                if query.is_empty() {
-                                    "暂无剪贴板记录"
-                                } else {
-                                    "没有匹配的记录"
-                                },
-                            ))
-                        })
-                        .children(entries.map(|entry| self.history_item(entry, cx))),
+                        .child(
+                            div()
+                                .id("clipboard-history")
+                                .min_h_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.history_scroll)
+                                .gap_2()
+                                .px_3()
+                                .pb_3()
+                                .when(empty, |list| {
+                                    list.child(
+                                        div().p_4().text_center().text_color(rgb(0xaab2c3)).child(
+                                            if query.is_empty() {
+                                                "暂无剪贴板记录"
+                                            } else {
+                                                "没有匹配的记录"
+                                            },
+                                        ),
+                                    )
+                                })
+                                .children(entries.map(|entry| self.history_item(entry, cx))),
+                        )
+                        .child(self.history_scrollbar()),
                 )
             })
             .when_some(self.status.as_ref(), |view, (message, is_error)| {
